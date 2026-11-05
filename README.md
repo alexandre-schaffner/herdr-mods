@@ -8,7 +8,6 @@ leaving out Herdr's shipped mods, state and caches.
 | --- | --- |
 | `workflows` | Claude Code dynamic workflows as a live graph (left to right or top to bottom), each agent's shell as a terminal, the owning session's live terminal, run outputs, and a workflow editor and library |
 | `claude-reader` | A Claude Code chat as a clean, live document, over or beside its terminal |
-| `revv` | The pull request a space is working on and its Revv review, with actions that hand findings to a coding agent |
 | `viewer` | Images, videos, Markdown and PDFs, opened from other mods |
 | `my-tabs` | Tabs, cloned from Herdr's `tabs` |
 

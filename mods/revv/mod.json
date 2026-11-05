@@ -1,6 +1,0 @@
-{
-  "place": "none",
-  "title": "Revv",
-  "focusable": true,
-  "overlay": { "kind": "popup", "width": 2, "height": 2, "frame": "none" }
-}
