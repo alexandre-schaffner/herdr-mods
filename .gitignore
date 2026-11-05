@@ -1,0 +1,24 @@
+# Whitelist: only my own mods and layouts. Everything else here is Herdr's
+# (shipped mods and layouts, state, caches, window bookkeeping).
+/*
+!/.gitignore
+!/README.md
+
+!/mods/
+/mods/*
+!/mods/claude-reader/
+!/mods/my-tabs/
+!/mods/revv/
+!/mods/viewer/
+!/mods/workflows/
+
+!/layouts/
+/layouts/*
+!/layouts/my-main.json
+
+# Generated or local, inside the mods
+gpui-kit.d.ts
+__pycache__/
+.cache/
+*.error
+.DS_Store
