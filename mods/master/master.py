@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "shared"
 import claude  # noqa: E402
 import masters  # noqa: E402
 from repos import repo_of  # noqa: E402
+sys.path.insert(1, os.path.join(os.path.dirname(HERE), "hq"))
+import hcguard  # noqa: E402
 
 PROMPT = os.path.join(HERE, "master.md")
 LABEL = masters.LABEL
@@ -90,14 +92,8 @@ def start(repo, space, task):
     resume = bool(sid and claude.find_transcript(sid))
     if not resume:
         sid = str(uuid.uuid4())
-    # HQ_REPO pins the master's `hq` commands to its repository, wherever it `cd`s.
-    # HQ_REPO pins the master's `hq` commands to its repository, HQ_EPIC to its epic.
     epic = repo.get("epic")
-    # A master started from inside another Claude session inherits CLAUDE_CODE_CHILD_SESSION, which turns
-    # transcript saving off; HQ reads the transcript, so force it on.
-    env = ["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1",
-           f"HQ_REPO={repo['path']}", *([f"HQ_EPIC={epic}"] if epic else [])]
-    argv = [*env, "claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
+    argv = [*masters.claude_env(repo), *hcguard.env(repo), "claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
             *(["--resume", sid] if resume else ["--session-id", sid])]
     who = (f"You are the master chat for the epic '{epic}' of this repository (HQ_EPIC={epic}): your managers, merge queue, "
            f"roadmap, inbox and to-dos are this epic's alone, and its worktrees are the '{epic}' group in the sidebar. ") if epic else ""
@@ -113,6 +109,7 @@ def start(repo, space, task):
         raise RuntimeError("herdr made no terminal: " + json.dumps(made))
     masters.record(repo["key"], sessionId=sid, terminal=addr, path=repo["path"], name=repo["name"], startedAt=int(time.time() * 1000))
     labelled = masters.set_label(addr, repo["key"])
+    subprocess.run(["hc", "label", addr, f"{hcguard.LABEL}={hcguard.org_name(repo)}"], capture_output=True, timeout=15)
     try:
         herdr("do", "tab.move", "--id", made.get("tab") or "", "--index", "0")
     except RuntimeError:
@@ -168,11 +165,7 @@ def _open(folder, space, task, epic=None):
 
 def main(argv):
     cmd, a = (argv[1] if len(argv) > 1 else ""), argv[2:]
-    epic = None
-    if "--epic" in a:
-        i = a.index("--epic")
-        epic = a[i + 1] if i + 1 < len(a) else None
-        del a[i:i + 2]
+    epic = masters.pop_flag(a, "--epic")
     try:
         if cmd == "plan" and a:
             out = cmd_plan(a[0], epic)

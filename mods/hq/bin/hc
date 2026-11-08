@@ -1,0 +1,25 @@
+#!/usr/bin/env -S python3 -I
+"""hc behind HQ's org wall (hcguard.py): refuses a cross-org target with exit 3, else runs the real hc.
+HC_GUARD_DRY=1 prints the decision instead of running anything."""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import hcguard  # noqa: E402
+
+
+def main(args):
+    why = hcguard.refusal(args)
+    if os.environ.get("HC_GUARD_DRY"):
+        print(why or f"hc: allowed: hc {' '.join(args[:2])}")
+        sys.exit(3 if why else 0)
+    if why:
+        sys.stderr.write(why + "\n")
+        sys.exit(3)
+    real = hcguard.real_hc()
+    os.execv(real, [real, *args])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -48,9 +48,10 @@ Keeping the picture current:
   hq status "<one line>"           the headline in HQ's status strip
   hq tick                          what changed since the last tick (decisions, steering, signals)
   hq lens | lens seed | lens set <file>   the live map (PR Lens graph) shown in HQ > Map
-  hq roadmap | roadmap seed | roadmap set <file>   each epic's plan in phases, shown in HQ > Roadmap
+  hq roadmap | roadmap seed | roadmap set <file> | roadmap drop <epic>   your epics' plans in phases (HQ > Roadmap)
   hq handoff                       the master's handoff file (path)
   hq compact <terminal>            /compact an idle Claude session
+  hq relabel                       put the org label (herdr.hq.org) on every running master and manager
   hq dream                         start a Dreaming pass over ~/agent-memory
 
 Files the person edits in HQ > Prompts: `hq files` prints their paths (approval policy,
@@ -79,6 +80,14 @@ import masters as registry  # noqa: E402
 from repos import repo_of  # noqa: E402
 sys.path.insert(1, HERE)
 import workflow_owners as wfo  # noqa: E402
+import roadmap as rmap  # noqa: E402
+import merge_queue as mq  # noqa: E402
+import hcguard as guard  # noqa: E402
+
+
+def H():
+    """This module, for the helper modules above that take it (they use its helpers)."""
+    return sys.modules[__name__]
 
 HOME = os.path.expanduser("~")
 MEMORY = os.path.join(HOME, "agent-memory")
@@ -218,8 +227,7 @@ def herdr(*args):
     return o
 
 
-def slugify(s):
-    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or "repo"
+slugify = guard.slugify
 
 
 def fail(msg):
@@ -231,13 +239,18 @@ def fail(msg):
 
 def repo_for(folder=None, epic=None):
     """The master scope a command acts in: the repo (see repo_base) and its epic: `--epic`, else
-    HQ_EPIC (set for an epic's master and its managers), else the epic of the folder's worktree
+    HQ_EPIC (set for every master and manager; masters.MAIN is the main scope), else the epic of the folder's worktree
     group when that epic has its own master. The main master's epic is the repo itself."""
     r = repo_base(folder)
     epic = epic or os.environ.get("HQ_EPIC") or None
+    if epic == registry.MAIN:
+        return registry.base_of(r)
+    # Only an epic of this repo (a saved pick can outlive a switch to another repo's space).
+    if epic and epic not in registry.groups(r) and epic not in registry.epic_masters(r):
+        epic = None
     if not epic:
         cwd = folder[5:] if folder and folder.startswith("auto:") else (folder or os.environ.get("HQ_REPO") or os.getcwd())
-        g = registry.epic_of_folder(os.path.realpath(os.path.expanduser(cwd or HOME)))
+        g = registry.epic_of_folder(r, os.path.expanduser(cwd or HOME))
         if g and g in registry.epic_masters(r):
             epic = g
     return registry.scope_of(r, epic)
@@ -252,8 +265,7 @@ def repo_base(folder=None):
         masters = claude.masters()
         # The focused space's repo when its master runs, else the newest master that runs,
         # else the newest master at all.
-        order = sorted(masters.values(), key=lambda m: m.get("startedAt") or 0, reverse=True)
-        cands = ([r] if r and r["key"] in masters else []) + [repo_of(m["path"]) for k, m in sorted(masters.items(), key=lambda x: x[1].get("startedAt") or 0, reverse=True) if m.get("path") and "#" not in k]
+        cands = ([r] if r and r["key"] in masters else []) + [repo_of(m["path"]) for k, m in sorted(masters.items(), key=lambda x: x[1].get("startedAt") or 0, reverse=True) if m.get("path") and not registry.parse_key(k)[1]]
         cands = [c for c in cands if c]
         for c in cands:
             if master_terminal(c)[0]:
@@ -267,7 +279,7 @@ def repo_base(folder=None):
 
 
 def data_dir(repo):
-    return os.path.join(APP, "data", "hq", slugify(repo["name"]))
+    return os.path.join(APP, "data", "hq", guard.org_name(repo))
 
 
 def paths(repo):
@@ -386,6 +398,15 @@ def activity(repo, n=60):
 _LS = None
 
 
+def hc(args, repo=None, timeout=30):
+    """`hc <args>` from the org this command acts in: a cross-org target is refused (exit 3),
+    by the same rule as bin/hc."""
+    why = guard.refusal(args, guard.org_name(repo) if repo else None)
+    if why:
+        return 3, "", why
+    return run(["hc", *args], timeout=timeout)
+
+
 def hc_ls():
     global _LS
     if _LS is None:
@@ -413,8 +434,11 @@ def master_terminal(repo):
     """(The master's terminal as `hc get` has it, or None; its registry entry), by the rule
     master.py uses too (shared/masters.py). Looked up once per command."""
     if repo["key"] not in _masters:
-        f = registry.find(repo)
-        _masters[repo["key"]] = (f["terminal"], f["entry"])
+        if repo["key"] not in registry.load():  # never started (an epic with no master): nothing to scan for
+            _masters[repo["key"]] = (None, {})
+        else:
+            f = registry.find(repo)
+            _masters[repo["key"]] = (f["terminal"], f["entry"])
     return _masters[repo["key"]]
 
 
@@ -647,7 +671,7 @@ def who_am_i(repo):
         for m in org(repo)["managers"]:
             if m.get("terminal") == addr:
                 role = m["id"]
-        role = role or wfo.role_of(sys.modules[__name__], repo, addr)
+        role = role or wfo.role_of(H(), repo, addr)
     return {"terminal": addr, "role": role}
 
 
@@ -734,7 +758,7 @@ def cmd_reopen(repo, item_id):
     log_activity(repo, "decision", f"Reopened: {it['title']}", id=item_id, by="person")
     mt, _ = master_terminal(repo)
     if mt and (prev or {}).get("verdict") in ("dismiss", "resolved"):
-        run(["hc", "send", mt["address"], f"HQ: the person reopened {item_id} ('{it['title']}'), which had been {'dismissed' if prev['verdict'] == 'dismiss' else 'resolved'}. It's open again in their inbox; treat it as unanswered and wait for their decision."], timeout=25)
+        hc(["send", mt["address"], f"HQ: the person reopened {item_id} ('{it['title']}'), which had been {'dismissed' if prev['verdict'] == 'dismiss' else 'resolved'}. It's open again in their inbox; treat it as unanswered and wait for their decision."], repo, timeout=25)
     out({"ok": True})
 
 
@@ -783,10 +807,10 @@ def deliver_one(repo, it, path):
         d.update(error="neither the asker nor the master is running", sending=None, tries=d.get("tries", 0) + 1)
         write_json(path, it)
         return
-    code, so, se = run(["hc", "send", primary, text if asker else f"{text} (its asker is gone: pass it on)"], timeout=25)
+    code, so, se = hc(["send", primary, text if asker else f"{text} (its asker is gone: pass it on)"], repo, timeout=25)
     ok = code == 0
     if ok and asker and master_addr and asker != master_addr and not d.get("copied"):
-        c, _, _ = run(["hc", "send", master_addr, f"FYI {text} (sent to {asker})"], timeout=25)
+        c, _, _ = hc(["send", master_addr, f"FYI {text} (sent to {asker})"], repo, timeout=25)
         d["copied"] = c == 0
     d.update(delivered=ok, sending=None, tries=d.get("tries", 0) + 1,
              error=None if ok else f"{primary}: {(se or so).strip()[-160:]}")
@@ -835,12 +859,14 @@ def cmd_manager_save(repo, file):
     if not isinstance(m, dict) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", m.get("id") or ""):
         fail("a manager needs an id: lowercase letters, digits and dashes")
     o = org(repo)
-    kind = m.get("kind") or "area"
+    cur0 = next((x for x in o["managers"] if x["id"] == m["id"]), {})
+    kind = m.get("kind") or cur0.get("kind") or "area"  # an update keeps its kind (and its checks)
     if kind == "merge-queue":
-        cur0 = next((x for x in o["managers"] if x["id"] == m["id"]), {})
         group = m.get("group") or cur0.get("group")
         if not group:
             fail("a merge queue serves one epic: pass --group <epic> (a worktree group's name)")
+        if not registry.owns(repo, group):
+            fail(f"'{group}' has its own master; its merge queue is that master's to start")
         other = next((x for x in o["managers"] if x["kind"] == "merge-queue" and x["id"] != m["id"]
                       and x.get("status") != "retired" and x.get("group") == group), None)
         if other:
@@ -945,8 +971,14 @@ def quiet(fn, *args):
     """Runs one of the mod's JSON commands for a CLI caller, without its JSON line."""
     import io
     keep, sys.stdout = sys.stdout, io.StringIO()
+    buf = sys.stdout
     try:
         fn(*args)
+    except SystemExit as e:
+        sys.stdout = keep
+        if e.code:  # fail(): the caller needs its message ("pass --group", "already has a queue")
+            sys.stdout.write(buf.getvalue())
+        raise
     finally:
         sys.stdout = keep
 
@@ -997,7 +1029,7 @@ def queue_brief(repo, m):
     """What a per-epic merge queue needs to know: its epic, trunk, the worktrees it serves, and the
     engine to start from (another queue's tick.py/scan.py), without touching other epics' queues."""
     group = m.get("group")
-    wts = sorted(repo_groups(repo).get(group, [])) if group else []
+    wts = sorted(os.path.basename(p) for p in registry.groups(repo).get(group, [])) if group else []
     base = os.path.basename(repo["path"].rstrip("/"))
     root = os.path.join(HOME, ".herdr", "worktrees", base)
     others = [x for x in org(repo)["managers"] if x["kind"] == "merge-queue" and x["id"] != m["id"] and x.get("status") != "retired"]
@@ -1012,7 +1044,7 @@ def queue_brief(repo, m):
              f"- Epic: **{group or '(none: ask the master which epic you serve)'}**. You batch only this epic's PRs.",
              f"- Trunk: `{m['trunk']}`." if m.get("trunk") else "- Trunk: find the branch this epic's PRs target (their base), confirm it with the master, then record it: `hq manager-set " + m["id"] + " --trunk <branch>`.",
              f"- Worktrees you serve ({len(wts)}): " + (", ".join(wts[:30]) + (" …" if len(wts) > 30 else "") if wts else "none grouped yet") +
-             f". Read READY lines only from `{root}/<these>/.audit/*/report.md`; the sidebar's groups are in `{GROUPS_FILE}`, re-read it each scan (worktrees join and leave).",
+             f". Read READY lines only from `{root}/<these>/.audit/*/report.md`; the sidebar's groups are in `{registry.GROUPS}`, re-read it each scan (worktrees join and leave).",
              f"- Batch branches: one prefix per epic so two queues never collide (new queues: `queue/{slug}/batch-<n>`; a queue already running keeps its names). Keep your state, lock and report in your own worktree. Never touch another epic's queue, state or batch branches."]
     if ref:
         lines.append(f"- Start from the `{ref[0]['id']}` queue's engine in `{ref[1]}` (tick.py, scan.py and its report's 'Local merge queue' and 'Handoff' sections for the rules). Copy it into your worktree, then make its paths, trunk, worktree scope and branch prefix yours. Don't edit theirs.")
@@ -1041,11 +1073,9 @@ def start_manager_tab(repo, m, folder, first):
     argv = ["claude", "--permission-mode", "auto", "--name", f"{m['id']} · manager"]
     if m.get("model"):
         argv[1:1] = ["--model", m["model"]]
-    # Keep its transcript on disk (HQ reads it) even when launched from inside another Claude session.
-    env = ["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"]
-    if repo.get("epic"):  # its `hq` commands act in its epic, wherever it runs
-        env += [f"HQ_REPO={repo['path']}", f"HQ_EPIC={repo['epic']}"]
-    argv = [*env, *argv]
+    # Its `hq` commands act in its master's scope wherever it runs (a worktree's group can get its
+    # own master later; the manager still reports to the master that runs it).
+    argv = [*registry.claude_env(repo), *guard.env(repo), *argv]
     space = space_for_folder(folder)
     args = ["--folder", folder, "--argv", json.dumps(argv), "--task", first]
     made = (herdr("do", "tab.new", "--space", space, "--name", m["id"], *args) if space
@@ -1053,7 +1083,7 @@ def start_manager_tab(repo, m, folder, first):
     addr = made.get("terminal")
     if not addr:
         raise RuntimeError("herdr made no terminal")
-    code, _, se = run(["hc", "label", addr, f"{MANAGER_LABEL}={m['id']}"])
+    code, _, se = run(["hc", "label", addr, f"{MANAGER_LABEL}={m['id']}", f"{guard.LABEL}={guard.org_name(repo)}"])
     if code != 0:
         sys.stderr.write(f"hc label {addr}: {se.strip()[-200:]}\n")  # the org still records the terminal
     return addr, made.get("tab")
@@ -1118,7 +1148,7 @@ def cmd_discover(repo):
     """Claude sessions in this repo's worktrees that look like managers (a .audit/<x>/report.md
     with a Handoff) and aren't in the org yet."""
     o = org(repo)
-    known = {m.get("terminal") for m in o["managers"]} | wfo.terminals(sys.modules[__name__], repo)
+    known = {m.get("terminal") for m in o["managers"]} | wfo.terminals(H(), repo)
     mt, _ = master_terminal(repo)
     found = []
     for t in hc_ls():
@@ -1194,7 +1224,7 @@ def cmd_adopt(repo, addr, mid, kind):
     if reports and not os.path.exists(charter_path(repo, mid)):
         brief = os.path.join(os.path.dirname(reports[0]), "brief.md")
         write(charter_path(repo, mid), adopted_charter(brief, h.get("goalFull")))
-    run(["hc", "label", addr, f"{MANAGER_LABEL}={mid}"])
+    run(["hc", "label", addr, f"{MANAGER_LABEL}={mid}", f"{guard.LABEL}={guard.org_name(repo)}"])
     log_activity(repo, "org", f"Adopted {addr} as manager {mid}", by="person")
     out({"ok": True})
 
@@ -1297,6 +1327,16 @@ def signals_for(repo, master, managers, items, s):
     return sig
 
 
+def guarded(fn, empty, *args):
+    """A side section of the snapshot: one that breaks (a malformed file, a gh hiccup) drops out
+    alone, logged to stderr, instead of taking the whole snapshot (and HQ's window) with it."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001: any failure here is that section's, not the snapshot's
+        sys.stderr.write(f"hq: {fn.__name__}: {type(e).__name__}: {e}\n")
+        return empty
+
+
 def cmd_snapshot(repo):
     p = ensure(repo)
     s = settings(repo)
@@ -1330,14 +1370,13 @@ def cmd_snapshot(repo):
     doc = claude.read_json(os.path.join(lens_dir(repo), "org.json")) if lens.get("at") else None
     lens["doc"] = doc or lens_seed_body(repo, managers, mt)
     lens["auto"] = not doc
-    wf = wfo.snapshot(sys.modules[__name__], repo)
+    wf = wfo.snapshot(H(), repo)
     out({"workflows": wf,
          "repo": repo, "now": NOW(), "paths": p, "settings": s, "master": master, "managers": managers, "lens": lens, "todo": todo,
          "home": home_meta(repo),
-         "roadmap": roadmap_snapshot(repo),
-         "epic": my_epic(repo), "epics": epics_snapshot(repo),
-         "merges": merges_snapshot(repo),
-         "queues": queues_snapshot(repo, managers),
+         "epic": registry.my_epic(repo), "epics": guarded(rmap.epics_snapshot, [], H(), repo),
+         "merges": guarded(mq.merges_snapshot, {}, H(), repo),
+         "queues": guarded(mq.queues_snapshot, [], H(), repo, managers, items),
          "artifacts": art_list(repo),
          "status": st, "counts": counts,
          "signals": sorted(signals_for(repo, master, managers, items, s) + wf["signals"], key=lambda x: ("alert", "warn", "info").index(x["level"])),
@@ -1416,17 +1455,8 @@ def cmd_tick(repo):
         lines.append("- Live map: not published yet. `hq lens` explains it; publish one this tick.")
     elif NOW() - lm["at"] > 45 * 60_000:
         lines.append(f"- Live map: last published {int((NOW() - lm['at']) / 60000)} min ago. Update it if the picture changed (`hq lens`).")
-    rm = roadmap_load(repo)
-    planned = {e.get("group") for e in roadmap_merged(repo).get("epics", [])}
-    others = {e for e in registry.epic_masters(repo) if e and e != my_epic(repo)}
-    # Plan your own epic; the main master also covers epics no master runs.
-    mine = {my_epic(repo)} if repo.get("epic") else set(repo_groups(repo)) - others
-    missing = sorted(g for g in mine - planned if g)
-    if missing:
-        lines.append(f"- Roadmap: no plan yet for {', '.join(missing[:4])}{'…' if len(missing) > 4 else ''}. `hq roadmap` explains it.")
-    elif rm.get("at") and NOW() - rm["at"] > 3 * 3600_000:
-        lines.append(f"- Roadmap: last published {int((NOW() - rm['at']) / 3600000)} h ago. Update phases that moved (`hq roadmap`).")
-    lines.extend(wfo.tick_lines(sys.modules[__name__], repo, since))
+    lines.extend(rmap.tick_lines(H(), repo))
+    lines.extend(wfo.tick_lines(H(), repo, since))
     # Only the master's tick consumes what's new: a manager or the person running `hq tick`
     # would otherwise take decisions and to-do notes the master never sees.
     me = who_am_i(repo)
@@ -1486,11 +1516,15 @@ def activity_since(repo, since):
     return rows
 
 
-def pr_url_base(repo):
-    code, so, _ = run(["git", "-C", repo["path"], "config", "--get", "remote.origin.url"], timeout=5)
-    url = so.strip()
-    m = re.match(r"https?://(?:[^@/]+@)?([^/]+)/(.+?)(?:\.git)?$", url) or re.match(r"(?:ssh://)?(?:[\w.-]+@)?([^:/]+)[:/](.+?)(?:\.git)?$", url)
-    return f"https://{m.group(1)}/{m.group(2)}/pull/" if m else None
+_PULL = {}
+
+
+def pull_url(repo):
+    """https://<host>/<owner>/<name>/pull/ for the repo's origin (once per process), or None."""
+    if repo["path"] not in _PULL:
+        host, name = gh_target(repo)
+        _PULL[repo["path"]] = f"https://{host}/{name}/pull/" if name else None
+    return _PULL[repo["path"]]
 
 
 def trunk_log(repo, since, trunk=None):
@@ -1524,7 +1558,7 @@ def cmd_recap(repo, since=None):
     comms = [c for c in (mfacts.get("comms") or []) if (c.get("at") or 0) >= since]
     acts = activity_since(repo, since)
     items = inbox_items(repo, include_closed=True)
-    base = pr_url_base(repo)
+    base = pull_url(repo)
 
     # A PR landed when a clause names it next to "merged" (or QUEUED-GREEN: green, about to land).
     # READY lines and "merged trunk into the branch" are not landings.
@@ -1592,7 +1626,7 @@ def type_text(addr, text):
     keys = []
     for ch in text:
         keys.append("space" if ch == " " else ch)
-    code, so, se = run(["hc", "keys", addr, *keys, "enter"], timeout=30)
+    code, so, se = hc(["keys", addr, *keys, "enter"], timeout=30)
     return code == 0, (se or so).strip()
 
 
@@ -1636,23 +1670,58 @@ def cmd_master_open(repo):
     out(got)
 
 
-def cmd_send(addr, text):
-    code, so, se = run(["hc", "send", addr, text], timeout=25)
+def cmd_send(repo, addr, text):
+    code, so, se = hc(["send", addr, text], repo, timeout=25)
     if code != 0:
         fail((se or so).strip()[-300:] or "hc send failed")
     out({"ok": True})
 
 
+def cmd_relabel():
+    """Puts the org label on every running master and manager, from the org files and the
+    masters registry, so sessions started before the label existed are walled in too."""
+    orgs = {}
+    for path in glob.glob(os.path.join(APP, "data", "hq", "*", "org.json")):
+        for m in (claude.read_json(path) or {}).get("managers") or []:
+            if m.get("terminal") and m.get("status") != "retired":
+                orgs[m["terminal"]] = os.path.basename(os.path.dirname(path))
+    for key, entry in registry.load().items():
+        t = hc_get(entry["terminal"]) if isinstance(entry, dict) and entry.get("terminal") and entry.get("path") else None
+        if t and (t.get("labels") or {}).get(registry.LABEL) == key:
+            orgs[t["address"]] = guard.org_name(registry.scope_of(repo_of(entry["path"]), registry.parse_key(key)[1]))
+    live = {t["address"] for t in hc_ls()}
+    for addr, org in sorted(orgs.items()):
+        if addr not in live:
+            continue
+        code, _, se = run(["hc", "label", addr, f"{guard.LABEL}={org}"])
+        print(f"{addr:6} {org}" + ("" if code == 0 else f"  (hc label: {se.strip()[-120:]})"))
+
+
 def cmd_autopilot(repo):
-    """The chores HQ does on its own each minute while it's open: deliver decisions, keep the
-    master's loop armed, compact the master when it's idle and large. One copy at a time."""
-    p = ensure(repo)
-    lock = open(os.path.join(p["dir"], "autopilot.lock"), "a")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until this process exits
-    except OSError:
-        out({"skipped": True})
-        return
+    """The chores HQ does on its own each minute while it's open, for every master of the repo
+    (each epic's too, not only the one on screen): deliver decisions, keep the master's loop
+    armed, compact the master when it's idle and large. One copy at a time per scope."""
+    did, locks = [], []
+    for sc in registry.all_scopes(repo):
+        p = ensure(sc)
+        lock = open(os.path.join(p["dir"], "autopilot.lock"), "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until this process exits
+        except OSError:
+            continue
+        locks.append(lock)
+        try:
+            mine = autopilot_scope(sc)
+        except Exception as e:  # noqa: BLE001: one epic's broken state mustn't stop the others' chores
+            sys.stderr.write(f"hq: autopilot {sc['name']}: {type(e).__name__}: {e}\n")
+            continue
+        who = f"{sc['epic']}: " if sc.get("epic") and sc["key"] != repo["key"] else ""
+        did += [who + d for d in mine]
+    out({"did": did})
+
+
+def autopilot_scope(repo):
+    p = paths(repo)
     s = settings(repo)
     did = []
     n = cmd_deliver(repo)
@@ -1678,7 +1747,7 @@ def cmd_autopilot(repo):
                 if ok:
                     did.append("compacted the master")
                     log_activity(repo, "compact", f"Compacted the master at {(facts.get('context') or 0) // 1000}k tokens", by="hq")
-    out({"did": did})
+    return did
 
 
 # ---- pull requests: state, CI checks (with the current or failing step) and description
@@ -2051,416 +2120,6 @@ def cmd_todo(repo, args):
     fail("hq todo [list | add | set <id> | start <id> | block <id> [on what] | done <id> | drop <id>]")
 
 
-# ---- the roadmap: each epic's plan in phases, kept by the master
-
-GROUPS_FILE = os.path.join(APP, "data", "my-spaces", "groups.json")
-PHASE_STATUS = ("done", "doing", "next", "later", "blocked")
-ITEM_STATUS = ("done", "doing", "todo")
-EPIC_STATUS = ("on track", "at risk", "blocked", "paused", "done")
-ROADMAP_GUIDE = """The roadmap is each epic's plan, in phases. An epic is one of the person's worktree groups
-(the my-spaces sidebar groups worktrees into epics); each gets its own page in HQ > Roadmap, the
-phases drawn left to right, phases that can run at the same time stacked side by side.
-
-You keep it: `hq roadmap set <file.json>` checks and publishes it (a bad file is refused with every
-problem listed; fix and retry). `hq roadmap seed` prints a start: every epic of this repo with its
-worktrees as hints and the phases you already published.
-
-Shape:
-  {"epics": [{"group": "<the group's name, exactly>", "goal": "<one plain sentence: what done looks like>",
-              "status": "on track|at risk|blocked|paused|done", "note"?: "<one line: what to know now>",
-              "phases": [{"id": "<lowercase-dashes>", "title": "<= 60 chars", "summary": "<= 160 chars",
-                          "status": "done|doing|next|later|blocked", "after"?: ["<phase id>", ...],
-                          "owner"?: "<manager id or person>", "eta"?: "<short, like 'this week'>",
-                          "items"?: [{"label": "<= 80 chars", "status": "done|doing|todo", "link"?: "<url>"}]}]}]}
-
-`after` lists the phases that must finish first. Phases with the same `after` run in parallel. No
-`after` means it can start now. Keep 3 to 8 phases per epic and up to 6 items per phase (PRs, units,
-decisions). Write like you talk to the person: plain words, no jargon, no internal codenames they
-wouldn't know. Say what each phase gets them, not how. Update it when a phase starts, finishes or
-gets stuck, and when the plan changes."""
-
-
-def roadmap_path(repo):
-    return os.path.join(paths(repo)["dir"], "roadmap.json")
-
-
-def repo_groups(repo):
-    """The person's worktree groups (epics) for this repo: name -> its worktrees' folder names."""
-    groups = claude.read_json(GROUPS_FILE) or {}
-    base = os.path.basename(repo["path"].rstrip("/"))
-    out_ = {}
-    for path, name in groups.items():
-        if not isinstance(name, str) or not name.strip():
-            continue
-        parent = os.path.basename(os.path.dirname(path.rstrip("/")))
-        if parent == base or path.startswith(repo["path"].rstrip("/") + "/"):
-            out_.setdefault(name, []).append(os.path.basename(path.rstrip("/")))
-    return out_
-
-
-def roadmap_load(repo):
-    return claude.read_json(roadmap_path(repo)) or {"epics": []}
-
-
-def roadmap_check(doc):
-    issues = []
-    add = lambda where, what: issues.append(f"{where}: {what}")
-    if not isinstance(doc, dict) or not isinstance(doc.get("epics"), list):
-        return ["(document): needs {\"epics\": [...]}"]
-    seen = set()
-    for i, e in enumerate(doc["epics"]):
-        w = f"epics[{i}]"
-        if not isinstance(e, dict):
-            add(w, "must be an object"); continue
-        g = e.get("group")
-        if not isinstance(g, str) or not g.strip():
-            add(w, "needs a group (the worktree group's name)"); continue
-        w = f"epic '{g}'"
-        if g in seen:
-            add(w, "listed twice")
-        seen.add(g)
-        if e.get("status", "on track") not in EPIC_STATUS:
-            add(w, f"status must be one of {', '.join(EPIC_STATUS)}")
-        if len(e.get("goal") or "") > 200:
-            add(w, "goal is longer than 200 chars")
-        phases = e.get("phases") or []
-        if not isinstance(phases, list):
-            add(w, "phases must be a list"); continue
-        ids = {}
-        for k, ph in enumerate(phases):
-            pw = f"{w} phase {k + 1}"
-            if not isinstance(ph, dict):
-                add(pw, "must be an object"); continue
-            pid = ph.get("id")
-            if not isinstance(pid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", pid):
-                add(pw, "id must be lowercase letters, digits and dashes"); continue
-            if pid in ids:
-                add(pw, f"id '{pid}' used twice")
-            ids[pid] = ph
-            if not (ph.get("title") or "").strip():
-                add(pw, "needs a title")
-            if len(ph.get("title") or "") > 60:
-                add(pw, "title is longer than 60 chars")
-            if len(ph.get("summary") or "") > 160:
-                add(pw, "summary is longer than 160 chars")
-            if ph.get("status") not in PHASE_STATUS:
-                add(pw, f"status must be one of {', '.join(PHASE_STATUS)}")
-            items = ph.get("items") or []
-            if not isinstance(items, list) or len(items) > 12:
-                add(pw, "items must be a list of at most 12")
-                continue
-            for j, it in enumerate(items):
-                if not isinstance(it, dict) or not (it.get("label") or "").strip():
-                    add(f"{pw} item {j + 1}", "needs a label")
-                elif it.get("status", "todo") not in ITEM_STATUS:
-                    add(f"{pw} item {j + 1}", f"status must be one of {', '.join(ITEM_STATUS)}")
-                elif len(it["label"]) > 80:
-                    add(f"{pw} item {j + 1}", "label is longer than 80 chars")
-        for pid, ph in ids.items():
-            for a in ph.get("after") or []:
-                if a not in ids:
-                    add(f"{w} phase '{pid}'", f"after names '{a}', which isn't a phase of this epic")
-        # No loops in `after`.
-        state = {}
-        def visit(pid, trail):
-            if state.get(pid) == 2:
-                return
-            if state.get(pid) == 1:
-                add(w, "phases wait on each other in a loop: " + " -> ".join(trail + [pid]))
-                return
-            state[pid] = 1
-            for a in ids.get(pid, {}).get("after") or []:
-                if a in ids:
-                    visit(a, trail + [pid])
-            state[pid] = 2
-        for pid in ids:
-            visit(pid, [])
-    return issues
-
-
-def cmd_roadmap_status(repo):
-    print(ROADMAP_GUIDE)
-    doc = roadmap_load(repo)
-    groups = repo_groups(repo)
-    have = {e.get("group"): e for e in doc.get("epics", [])}
-    print()
-    print("Epics of this repo (worktree groups):" if groups else "This repo has no worktree groups yet: nothing to plan.")
-    for g, wts in sorted(groups.items()):
-        e = have.get(g)
-        if e:
-            ph = e.get("phases") or []
-            done = sum(1 for x in ph if x.get("status") == "done")
-            print(f"- {g}: {done}/{len(ph)} phases done, {e.get('status', 'on track')}")
-        else:
-            print(f"- {g}: no plan yet ({len(wts)} worktrees)")
-    if doc.get("at"):
-        print(f"Last published {int((NOW() - doc['at']) / 60000)} min ago by {doc.get('by') or 'someone'}: {roadmap_path(repo)}")
-
-
-def cmd_roadmap_seed(repo):
-    doc = roadmap_load(repo)
-    have = {e.get("group"): e for e in doc.get("epics", [])}
-    epics = []
-    for g, wts in sorted(repo_groups(repo).items()):
-        e = dict(have.get(g) or {"group": g, "goal": "", "status": "on track", "phases": []})
-        e["_worktrees"] = sorted(wts)
-        epics.append(e)
-    print(json.dumps({"epics": epics}, indent=1))
-
-
-def cmd_roadmap_set(repo, src):
-    ensure(repo)
-    text = read(src)
-    if text is None:
-        fail(f"no file {src}")
-    try:
-        doc = json.loads(text)
-    except ValueError as e:
-        print(f"The roadmap was NOT updated: {src} isn't valid JSON ({e}).")
-        sys.exit(1)
-    issues = roadmap_check(doc)
-    if issues:
-        print("The roadmap was NOT updated. Fix these and run hq roadmap set again:")
-        for i in issues:
-            print(f"- {i}")
-        sys.exit(1)
-    for e in doc["epics"]:
-        e.pop("_worktrees", None)
-    who = who_am_i(repo)
-    doc = {"epics": doc["epics"], "at": NOW(), "by": who.get("role") or who.get("terminal")}
-    write_json(roadmap_path(repo), doc)
-    unknown = sorted({e["group"] for e in doc["epics"]} - set(repo_groups(repo)))
-    log_activity(repo, "roadmap", f"Roadmap updated: {len(doc['epics'])} epics", by=doc["by"])
-    print(f"ok: roadmap published ({len(doc['epics'])} epics), shown in HQ > Roadmap")
-    if unknown:
-        print(f"note: no worktree group named {', '.join(unknown)}; those epics still show, under 'Other plans'.")
-
-
-# ---- merged PRs over the last two weeks (Home's chart), from GitHub, cached and refreshed in the background
-
-MERGES_TTL = 300_000
-MERGES_DAYS = 14
-
-
-def merges_path(repo):
-    return os.path.join(paths(repo)["dir"], "merges.json")
-
-
-def merges_refresh(repo):
-    """Counts merged PRs per local day (14 days) and per hour today; writes merges.json."""
-    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - (MERGES_DAYS - 1) * 86400))
-    code, so, se = run(["gh", "pr", "list", "--state", "merged", "--search", f"merged:>={since}", "--limit", "2000",
-                        "--json", "number,mergedAt,author,title"], timeout=60, cwd=repo["path"])
-    if code != 0:
-        prev = claude.read_json(merges_path(repo)) or {}
-        write_json(merges_path(repo), {**prev, "at": NOW(), "error": (se or so).strip()[-200:]})
-        return
-    prs = json.loads(so or "[]")
-    titles = {str(p["number"]): p.get("title") or "" for p in prs}
-    c2, so2, _ = run(["gh", "pr", "list", "--state", "open", "--limit", "400", "--json", "number,title"], timeout=60, cwd=repo["path"])
-    if c2 == 0:
-        titles.update({str(p["number"]): p.get("title") or "" for p in json.loads(so2 or "[]")})
-    today = time.strftime("%Y-%m-%d")
-    days = {time.strftime("%Y-%m-%d", time.localtime(time.time() - k * 86400)): 0 for k in range(MERGES_DAYS - 1, -1, -1)}
-    hours = [0] * 24
-    authors = {}
-    for pr in prs:
-        try:
-            ts = calendar.timegm(time.strptime(pr["mergedAt"], "%Y-%m-%dT%H:%M:%SZ"))
-        except (KeyError, ValueError):
-            continue
-        day = time.strftime("%Y-%m-%d", time.localtime(ts))
-        if day in days:
-            days[day] += 1
-        if day == today:
-            hours[time.localtime(ts).tm_hour] += 1
-            who = (pr.get("author") or {}).get("login") or "?"
-            authors[who] = authors.get(who, 0) + 1
-    write_json(merges_path(repo), {"at": NOW(), "days": [{"date": d, "count": n} for d, n in days.items()], "hours": hours,
-                                   "authors": sorted(authors.items(), key=lambda x: -x[1])[:5], "titles": titles})
-
-
-def merges_snapshot(repo):
-    """The cached counts; a stale cache starts a background refresh (gh takes a few seconds)."""
-    m = claude.read_json(merges_path(repo)) or {}
-    lock = merges_path(repo) + ".lock"
-    fresh_lock = os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 120
-    if NOW() - (m.get("at") or 0) > MERGES_TTL and not fresh_lock:
-        os.makedirs(os.path.dirname(lock), exist_ok=True)
-        write(lock, str(os.getpid()))
-        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--repo", repo["path"], "merges-refresh"],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    return {k: v for k, v in m.items() if k != "titles"}
-
-
-# ---- the merge queue (HQ > Queue): the queue engine's state.json, summarised
-
-QUEUE_LIVE = ("ci", "green", "red", "error", "stale", "trunk-check")
-
-
-def queue_state_path(repo):
-    base = os.path.basename(repo["path"].rstrip("/"))
-    found = glob.glob(os.path.join(HOME, ".herdr", "worktrees", base, "*", ".audit", "*", "queue", "state.json"))
-    found += glob.glob(os.path.join(repo["path"], ".audit", "*", "queue", "state.json"))
-    return max(found, key=os.path.getmtime) if found else None
-
-
-def iso_ms(s):
-    if not s:
-        return None
-    try:
-        return int(calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) * 1000)
-    except ValueError:
-        return None
-
-
-def pr_base(repo):
-    """https://<host>/<owner>/<repo>/pull/ from the origin remote (ssh or https)."""
-    code, so, _ = run(["git", "-C", repo["path"], "remote", "get-url", "origin"], timeout=5)
-    m = re.match(r"(?:ssh://|https://)?(?:[^@/]+@)?([^/:]+)[:/](.+?)(?:\.git)?$", so.strip()) if code == 0 else None
-    return f"https://{m.group(1)}/{m.group(2)}/pull/" if m else None
-
-
-def queues_snapshot(repo, managers):
-    """One summary per merge-queue manager (its epic's queue); a queue found with no manager too."""
-    out_, seen_paths = [], set()
-    for m in managers:
-        if m.get("kind") != "merge-queue" or m.get("status") == "retired":
-            continue
-        hit = glob.glob(os.path.join(m.get("worktree") or "/nonexistent", ".audit", "*", "queue", "state.json"))
-        q = queue_snapshot(repo, hit[0] if hit else None) if hit else None
-        if hit:
-            seen_paths.add(hit[0])
-        out_.append({**(q or {"missing": True}), "epic": m.get("group"), "manager": m["id"], "terminal": m.get("terminal"),
-                     "status": m.get("status"), "trunk": m.get("trunk")})
-    loose = queue_state_path(repo)
-    if loose and loose not in seen_paths and not out_:
-        q = queue_snapshot(repo, loose)
-        if q:
-            out_.append({**q, "epic": None, "manager": None})
-    return out_
-
-
-def queue_snapshot(repo, path=None):
-    path = path or queue_state_path(repo)
-    st = claude.read_json(path) if path else None
-    if not st:
-        return None
-    titles = (claude.read_json(merges_path(repo)) or {}).get("titles") or {}
-    seen = st.get("seen") or {}
-    closed = set(st.get("closed") or [])
-    queued = st.get("queued") or {}
-    rejected = st.get("rejected") or {}
-    held = st.get("held") or {}
-    owners = st.get("owners") or {}
-    t0 = time.mktime(time.localtime()[:3] + (0, 0, 0) + time.localtime()[6:])  # local midnight
-    want = set()
-
-    def member(m):
-        want.add(str(m["pr"]))
-        k = f"{m['pr']}:{m['sha']}"
-        return {"pr": m["pr"], "owner": m.get("owner"), "seen": iso_ms(seen.get(k)), "parent": m.get("stack_parent")}
-
-    def batch(b):
-        created, ci_end, merged = iso_ms(b.get("created")), iso_ms(b.get("ci_end")), iso_ms(b.get("merged"))
-        return {"n": b["n"], "status": b["status"], "trunk": b.get("trunk"), "failing": b.get("failing"), "reruns": b.get("reruns", 0),
-                "created": created, "ciEnd": ci_end, "merged": merged, "pr": b.get("pr"), "members": [member(m) for m in b.get("members") or []]}
-
-    batches = st.get("batches") or []
-    live = [batch(b) for b in batches if b["status"] in QUEUE_LIVE]
-    recent = [batch(b) for b in batches if b["status"] in ("done", "released")][-12:][::-1]
-    # Waiting: READY lines the scanner has seen whose PR is open and not yet queued, rejected or in a live batch.
-    in_live = {m["pr"] for b in live for m in b["members"]}
-    waiting = {}
-    for k, at in seen.items():
-        pr_s, _, sha = k.partition(":")
-        pr = int(pr_s)
-        if pr in closed or pr in in_live or k in queued or k in rejected:
-            continue
-        cur = waiting.get(pr)
-        if not cur or (iso_ms(at) or 0) > cur["since"]:
-            waiting[pr] = {"pr": pr, "since": iso_ms(at) or 0, "owner": owners.get(pr_s), "held": held.get(k),
-                           "after": (st.get("after") or {}).get(pr_s), "priority": pr in (st.get("priority") or [])}
-    for w in waiting.values():
-        want.add(str(w["pr"]))
-    # Today, from finished batches.
-    today = [b for b in batches if (iso_ms(b.get("created")) or 0) >= t0 * 1000]
-    landed = [b for b in today if b["status"] == "done" or b["status"] == "trunk-check"]
-    ci_mins = sorted(((iso_ms(b["ci_end"]) - iso_ms(b["created"])) / 60000) for b in batches[-12:] if b.get("ci_end") and b.get("created"))
-    waits = sorted(((iso_ms(b["merged"]) - (iso_ms(seen.get(f"{m['pr']}:{m['sha']}")) or iso_ms(b["created"]))) / 60000)
-                   for b in landed if b.get("merged") for m in b.get("members") or [])
-    med = lambda xs: xs[len(xs) // 2] if xs else None
-    rej = []
-    for k, why in list(rejected.items())[-4:][::-1]:
-        pr_s = k.partition(":")[0]
-        want.add(pr_s)
-        rej.append({"pr": int(pr_s), "why": clip(why, 220)})
-    return {
-        "at": int(os.path.getmtime(path) * 1000), "path": path, "nextBatch": st.get("next_batch"), "prBase": pr_base(repo),
-        "live": live, "recent": recent, "waiting": sorted(waiting.values(), key=lambda w: w["since"]),
-        "rules": {"after": st.get("after") or {}, "apart": st.get("apart") or [], "priority": st.get("priority") or [], "soloOk": st.get("solo_ok") or []},
-        "rejected": rej, "throughput": st.get("throughput"),
-        "today": {"batches": len(today), "landedBatches": len(landed), "prs": sum(len(b.get("members") or []) for b in landed),
-                  "failed": sum(1 for b in today if b["status"] == "released" or b.get("failing")),
-                  "ciMin": med(ci_mins), "waitMin": med(waits)},
-        "titles": {k: titles[k] for k in want if k in titles},
-    }
-
-
-def my_epic(repo):
-    """The epic this scope's master runs: the scope's own, or the main master's."""
-    return repo.get("epic") or registry.main_epic(repo)
-
-
-def all_scopes(repo):
-    """This scope and the repo's other masters' scopes (each epic's own HQ data)."""
-    base = {k: v for k, v in repo.items() if k not in ("epic", "repoKey")}
-    if repo.get("epic"):
-        base.update(key=repo["repoKey"], name=repo["name"].split(" · ")[0])
-    out_ = [base]
-    for ep in registry.epic_masters(repo):
-        sc = registry.scope_of(base, ep) if ep else base
-        if sc["key"] != base["key"]:
-            out_.append(sc)
-    return out_
-
-
-def roadmap_merged(repo):
-    """Every epic's plan, from whichever master runs it (its own plan wins over another's)."""
-    plans, at, by = {}, None, None
-    for sc in all_scopes(repo):
-        doc = roadmap_load(sc)
-        mine = my_epic(sc)
-        for e in doc.get("epics", []):
-            if e.get("group") == mine or e.get("group") not in plans:
-                plans[e.get("group")] = e
-        if doc.get("at") and (not at or doc["at"] > at):
-            at, by = doc["at"], doc.get("by")
-    return {"epics": list(plans.values()), "at": at, "by": by}
-
-
-def epics_snapshot(repo):
-    """Every worktree group of the repo and its master (address and state), the current one marked."""
-    regs = registry.epic_masters(repo)
-    rows = {t["address"]: t for t in hc_ls()}
-    mine = my_epic(repo)
-    out_ = []
-    for g in sorted(set(repo_groups(repo)) | {e for e in regs if e}):
-        e = regs.get(g)
-        t = rows.get((e or {}).get("terminal"))
-        out_.append({"name": g, "current": g == mine, "main": bool(e) and "#" not in e["key"],
-                     "master": (e or {}).get("terminal") if t else None,
-                     "status": (t or {}).get("status") if t else ("gone" if e else None)})
-    return out_
-
-
-def roadmap_snapshot(repo):
-    doc = roadmap_merged(repo)
-    groups = repo_groups(repo)
-    return {"at": doc.get("at"), "by": doc.get("by"), "epics": doc.get("epics", []),
-            "groups": [{"name": g, "worktrees": len(w)} for g, w in sorted(groups.items())]}
-
-
 # ---- the live map: a PR Lens graph of the org and its work, kept by the master
 
 LENS_HOME = os.path.join(HOME, ".local/share/hq-lens")
@@ -2675,15 +2334,7 @@ def cmd_dream(repo):
 
 def main(argv):
     args = argv[1:]
-    folder = epic = None
-    if "--repo" in args:
-        i = args.index("--repo")
-        folder = args[i + 1] if i + 1 < len(args) else None
-        del args[i:i + 2]
-    if "--epic" in args:
-        i = args.index("--epic")
-        epic = args[i + 1] if i + 1 < len(args) else None
-        del args[i:i + 2]
+    folder, epic = registry.pop_flag(args, "--repo"), registry.pop_flag(args, "--epic")
     if not args:
         print(__doc__)
         return
@@ -2692,7 +2343,9 @@ def main(argv):
         if cmd in ("compact",):
             return cmd_compact(a[0])
         if cmd == "send":
-            return cmd_send(a[0], " ".join(a[1:]))
+            return cmd_send(repo_for(folder, epic), a[0], " ".join(a[1:]))
+        if cmd == "relabel":
+            return cmd_relabel()
         if cmd == "memory":
             return cmd_memory()
         if cmd == "memory-show":
@@ -2701,7 +2354,7 @@ def main(argv):
         if cmd in wfo.COMMANDS:
             if a[:1] == ["help"]:
                 return print(wfo.HELP)
-            return wfo.COMMANDS[cmd](sys.modules[__name__], repo, a)
+            return wfo.COMMANDS[cmd](H(), repo, a)
         if cmd == "ask":
             if not a or a[0] not in ("approval", "question"):
                 fail("hq ask approval|question --title T --body B")
@@ -2764,21 +2417,10 @@ def main(argv):
         if cmd == "todo":
             return cmd_todo(repo, a)
         if cmd == "merges-refresh":
-            try:
-                return merges_refresh(repo)
-            finally:
-                try:
-                    os.remove(merges_path(repo) + ".lock")
-                except OSError:
-                    pass
+            return mq.cmd_refresh(H(), repo)
         if cmd == "roadmap":
-            if not a:
-                return cmd_roadmap_status(repo)
-            if a[0] == "set" and len(a) > 1:
-                return cmd_roadmap_set(repo, a[1])
-            if a[0] == "seed":
-                return cmd_roadmap_seed(repo)
-            fail("hq roadmap [set <file> | seed]")
+            ensure(repo)
+            return rmap.cmd(H(), repo, a)
         if cmd == "lens":
             if not a:
                 return cmd_lens_status(repo)
