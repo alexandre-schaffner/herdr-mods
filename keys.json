@@ -59,7 +59,9 @@
     "ctrl-9": "space.select:9",
     "cmd-shift-g": "mod.open:workflows",
     "cmd-shift-m": "mod.open:claude-reader",
-    "cmd-alt-m": "mod.open:master"
+    "cmd-alt-m": "mod.open:master",
+    "cmd-shift-h": "mod.open:hq",
+    "cmd-shift-u": "mod.open:proxy"
   },
   "terminal": {
     "cmd-c": "terminal.copy",

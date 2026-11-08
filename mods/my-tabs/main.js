@@ -17,6 +17,9 @@ function find(node, id) {
   return null;
 }
 
+// HQ is a main view in the layout's `center` stack: a tab click goes back to the workspace.
+const toWorkspace = () => { if (find(layout(), "center")?.active === "hq") run("layout.select", { stack: "center", child: "workspace" }); };
+
 export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null;
@@ -128,7 +131,7 @@ export default class Tabs extends View {
         .on_mouse_up("left", () => {
           const from = this.pressed; this.pressed = null;
           if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex(x => x.id === c.id) + 1 });
-          else run("tab.select", { id: c.id });
+          else { run("tab.select", { id: c.id }); toWorkspace(); }
         })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }); })
         .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
@@ -165,6 +168,11 @@ export default class Tabs extends View {
       }).size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
+      .when(Boolean(find(root, "center")?.children?.some(c => c.id === "hq")), el => el.child(
+        h_flex().id("tab-hq").h(29).px(10).gap(6).flex_none().items_center().rounded(7).text_size(12.8).text_color(t.muted)
+          .tooltip("HQ: the master's desk (⌘⇧H)").hover(s => s.bg(t.hover).text_color(t.foreground)).on_mouse_down("left", stop)
+          .on_click(() => run("layout.select", { stack: "center", child: "hq" }))
+          .child(svg("shared/icons/crown.svg").size(13)).child("HQ")))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "my-new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))

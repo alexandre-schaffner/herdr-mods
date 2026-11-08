@@ -76,92 +76,112 @@
       "type": "column",
       "children": [
         {
-          "id": "tabs",
-          "type": "block",
-          "content": {
-            "mod": "my-tabs"
-          },
-          "size": {
-            "px": 42
-          },
-          "window_drag": true
-        },
-        {
-          "id": "work-body",
-          "type": "row",
+          "id": "center",
+          "type": "stack",
           "children": [
             {
-              "id": "main",
-              "type": "block",
-              "content": {
-                "tab": "active",
-                "pane": {
-                  "header": {
-                    "content": {
-                      "mod": "my-pane"
-                    },
-                    "reveal": "always",
-                    "height": 30,
-                    "position": "top"
-                  },
-                  "background": "background",
-                  "border": {
-                    "width": 1,
-                    "color": "border"
-                  },
-                  "focus": {
-                    "width": 1,
-                    "color": "accent"
-                  },
-                  "radius": 10,
-                  "gap": 8,
-                  "lone": true
-                }
-              }
-            },
-            {
-              "id": "panel",
+              "id": "workspace",
               "type": "column",
               "children": [
                 {
-                  "id": "panel-body",
-                  "type": "stack",
+                  "id": "tabs",
+                  "type": "block",
+                  "content": {
+                    "mod": "my-tabs"
+                  },
+                  "size": {
+                    "px": 42
+                  },
+                  "window_drag": true
+                },
+                {
+                  "id": "work-body",
+                  "type": "row",
                   "children": [
                     {
-                      "id": "files",
+                      "id": "main",
                       "type": "block",
                       "content": {
-                        "mod": "files"
+                        "tab": "active",
+                        "pane": {
+                          "header": {
+                            "content": {
+                              "mod": "my-pane"
+                            },
+                            "reveal": "always",
+                            "height": 30,
+                            "position": "top"
+                          },
+                          "background": "background",
+                          "border": {
+                            "width": 1,
+                            "color": "border"
+                          },
+                          "focus": {
+                            "width": 1,
+                            "color": "accent"
+                          },
+                          "radius": 10,
+                          "gap": 8,
+                          "lone": true
+                        }
                       }
                     },
                     {
-                      "id": "changes",
-                      "type": "block",
-                      "content": {
-                        "mod": "changes"
-                      }
-                    },
-                    {
-                      "id": "workflows",
-                      "type": "block",
-                      "content": {
-                        "mod": "workflows"
-                      }
+                      "id": "panel",
+                      "type": "column",
+                      "children": [
+                        {
+                          "id": "panel-body",
+                          "type": "stack",
+                          "children": [
+                            {
+                              "id": "files",
+                              "type": "block",
+                              "content": {
+                                "mod": "files"
+                              }
+                            },
+                            {
+                              "id": "changes",
+                              "type": "block",
+                              "content": {
+                                "mod": "changes"
+                              }
+                            },
+                            {
+                              "id": "workflows",
+                              "type": "block",
+                              "content": {
+                                "mod": "workflows"
+                              }
+                            }
+                          ],
+                          "active": "files"
+                        }
+                      ],
+                      "size": {
+                        "px": 368
+                      },
+                      "min": 280,
+                      "max": 1600,
+                      "hidden": true
                     }
                   ],
-                  "active": "files"
+                  "padding": 8,
+                  "gap": 8
                 }
-              ],
-              "size": {
-                "px": 368
-              },
-              "min": 280,
-              "max": 1600,
-              "hidden": true
+              ]
+            },
+            {
+              "id": "hq",
+              "type": "block",
+              "content": {
+                "mod": "hq"
+              }
             }
           ],
-          "padding": 8,
-          "gap": 8
+          "active": "workspace"
         },
         {
           "id": "status",

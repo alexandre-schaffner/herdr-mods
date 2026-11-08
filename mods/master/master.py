@@ -28,6 +28,8 @@ LABEL = "herdr.master"
 MODEL = "opus[1m]"
 SKILL = "/pstack:poteto-mode"
 FIRST = "You are this repository's master chat. Read your memory, then wait for my first request."
+# A new master starts in poteto mode and perpetual (see "Poteto mode" and "The tick" in master.md).
+START = "You are this repository's master chat. Read your memory, then start your perpetual tick: invoke the loop skill with 'master tick' (self-paced)."
 
 
 def load():
@@ -110,7 +112,7 @@ def start(repo, space, task):
         sid = str(uuid.uuid4())
     argv = ["claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
             *(["--resume", sid] if resume else ["--session-id", sid])]
-    first = task if resume else f"{SKILL} {task or FIRST}"
+    first = task if resume else f"{SKILL} {task or START}"
     space = home_space(repo, space)
     args = ["--folder", repo["path"], "--argv", json.dumps(argv), *(["--task", first] if first else [])]
     made = (herdr("do", "tab.new", "--space", space, "--name", "Master", *args) if space

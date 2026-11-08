@@ -9,7 +9,9 @@ Herdr's shipped mods, state and caches.
 | `workflows` | Claude Code dynamic workflows as a live graph (left to right or top to bottom), each agent's shell as a terminal, the owning session's live terminal, run outputs, and a workflow editor and library (`cmd-shift-g`; `cmd-s` saves, `cmd-enter` generates) |
 | `master` | `cmd-alt-m`: go to the repo's master chat, starting or resuming it in a pinned Master tab (`master.py`, prompt `master.md`, state in `data/master/masters.json`) |
 | `claude-reader` | A Claude Code chat as a clean, live document, over or beside its terminal (`cmd-shift-m`) |
-| `claude-picker` | Account, model and effort for Claude: a dialog when starting a Claude tab, a popup to switch model and effort live. Accounts in `accounts.json` |
+| `hq` | `cmd-shift-h`: HQ, the master chat's desk as a main view (the `center` stack in `my-main`): live org map, next moves, review inbox, chat, roster, brief, proxy usage, memory and prompts. Agents drive it with `hq` (`hq.py`, `~/.local/bin/hq`; state in `data/hq/<repo>/`) |
+| `proxy` | `cmd-shift-u`: what the local CLIProxyAPI pool did (requests, tokens, cache, plan limits) and its routing (strategy, account priority). `proxy.py` collects and reports |
+| `claude-picker` | Account, model and effort for Claude: a dialog when starting a Claude tab, a popup to switch model and effort live, or the account (restarts Claude with `--resume`, same conversation). Accounts in `accounts.json` |
 | `my-tabs` | Tabs, cloned from Herdr's `tabs`: per-panel widths, a Workflows panel button; its + opens `my-new-menu` |
 | `my-new-menu` | The + menu, cloned from Herdr's `new-menu`: Claude goes through `claude-picker` |
 | `my-pane` | Pane header, cloned from Herdr's `pane`: Claude panes show their account · model · effort, click to switch |

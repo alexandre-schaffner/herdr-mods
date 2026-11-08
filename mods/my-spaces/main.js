@@ -73,6 +73,12 @@ export function tone(t, status) {
   return t[status] ?? t.unknown;
 }
 
+// HQ is a main view in the layout's `center` stack: picking a space goes back to the workspace.
+function toWorkspace() {
+  const find = (n) => (n?.id === "center" ? n : (n?.children ?? []).map(find).find(Boolean));
+  if (find(layout())?.active === "hq") run("layout.select", { stack: "center", child: "workspace" });
+}
+
 export default class Spaces extends View {
   init(_props, cx) {
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
@@ -668,7 +674,7 @@ export default class Spaces extends View {
         if (from !== null && over === w.id && from !== w.id) {
           const index = spaces().findIndex(s => s.id === w.id);
           if (index !== -1) run("space.move", { id: from, index: index + 1 });
-        } else if (from === w.id) run("space.select", { id: w.id });
+        } else if (from === w.id) (run("space.select", { id: w.id }), toWorkspace());
         cx.notify();
       })
       .on_mouse_down("right", () => this.menu(w))
@@ -780,7 +786,7 @@ export default class Spaces extends View {
       .gap(4)
       .when(w.active, el => el.bg(t.raised))
       .hover(s => s.bg(t.hover))
-      .on_click(() => run("space.select", { id: w.id }))
+      .on_click(() => (run("space.select", { id: w.id }), toWorkspace()))
       .child(
         div()
           .text_color(w.active ? t.foreground : t.muted)
