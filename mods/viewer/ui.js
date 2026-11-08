@@ -1,26 +1,12 @@
 // Look, formatting and the few controls every kind of file shares.
 
 import { h_flex, Scrollbar, v_flex } from "gpui-base";
-import { div, svg } from "gpui-kit";
-import { exec, settings } from "herdr";
+import { div } from "gpui-kit";
+import { exec } from "herdr";
 
-export const icon = (name, size, color) => svg(`mods/viewer/icons/${name}.svg`).flex_none().w(size).h(size).text_color(color);
-export const mono = () => settings()?.font_family || settings()?.font || "JetBrains Mono";
-export const dark = () => settings()?.dark !== false;
+import { alpha, icon, mix, mono } from "./shared/look.js";
 
-/** A theme color at `a` times its own opacity. */
-export function alpha(hex, a) {
-  const c = hex ?? "#888888";
-  const own = c.length >= 9 ? parseInt(c.slice(7, 9), 16) / 255 : 1;
-  const v = Math.round(Math.max(0, Math.min(1, a * own)) * 255);
-  return `${c.slice(0, 7)}${v.toString(16).padStart(2, "0")}`;
-}
-
-export function mix(a, b, t) {
-  const p = h => [1, 3, 5].map(i => Number.parseInt((h ?? "#000000").slice(i, i + 2), 16));
-  const [x, y] = [p(a), p(b)];
-  return `#${x.map((v, i) => Math.round(v + (y[i] - v) * t).toString(16).padStart(2, "0")).join("")}`;
-}
+export { alpha, icon, mix, mono };
 
 // ─── formatting ──────────────────────────────────────────────────────────
 

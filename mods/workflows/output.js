@@ -26,8 +26,6 @@ const look = (f, t) => {
   return { icon: l.icon, color: l.color(t), word: l.word };
 };
 
-export const MEDIA = new Set(["video", "image", "audio", "pdf"]);
-
 /** The run has something worth an Output view. */
 export const hasOutput = run => {
   const o = run?.output;

@@ -5,7 +5,7 @@ import { h_flex, TextView, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 import { seg } from "./ui.js";
 import { alpha, clip, compact, icon, mix, mono, ok } from "./util.js";
-import { openLink, openViewer, viewable } from "./viewer.js";
+import { openLink, openViewer, viewable } from "./shared/viewer-link.js";
 
 /** Shortens multi-line text to `n` characters, keeping its line breaks. */
 const cut = (text, n) => {

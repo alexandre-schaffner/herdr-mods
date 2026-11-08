@@ -2,8 +2,9 @@
 
   python3 -I read.py --pid <pid> --cwd <dir> [--path <jsonl>] [--offset <bytes>]
 
-Finds the session a Claude Code process is writing (~/.claude/sessions/<pid>.json →
-~/.claude/projects/<slug>/<sessionId>.jsonl, else the newest transcript for the folder),
+Finds the session a terminal runs (`pid`: its shell or claude itself; any account's
+sessions/<pid>.json whose process sits under it → projects/<slug>/<sessionId>.jsonl, else
+the newest transcript for the folder),
 parses the lines after `offset` and prints one JSON object: the events, the new offset
 and session facts. Only complete lines are consumed, so a line being written is read
 on the next call. Big tool outputs are clipped; on a huge first read the oldest events
@@ -11,17 +12,14 @@ are dropped to keep the output small.
 """
 
 import argparse
-import base64
-import hashlib
 import json
 import os
 import re
 import sys
 
-HOME = os.path.expanduser("~")
-CLAUDE = os.path.join(HOME, ".claude")
-IMAGES = os.path.join(HOME, ".cache", "claude-reader", "images")
-IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "shared"))
+from claude import ANSI, PROJECTS, find_transcript, save_image, session_in, slug  # noqa: E402
+
 OUT_BUDGET = 5_500_000
 RESULT_HEAD, RESULT_TAIL = 2600, 900
 
@@ -31,21 +29,6 @@ CMD_NAME, CMD_ARGS = TAG("command-name"), TAG("command-args")
 LOCAL_OUT = TAG("local-command-stdout")
 BASH_IN, BASH_OUT, BASH_ERR = TAG("bash-input"), TAG("bash-stdout"), TAG("bash-stderr")
 SUMMARY, STATUS = TAG("summary"), TAG("status")
-ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-
-def slug(path):
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
-
-
-def read_json(path):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
 def newest(folder):
     try:
         files = [os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".jsonl")]
@@ -55,22 +38,15 @@ def newest(folder):
 
 
 def resolve(pid, cwd, given):
-    if pid:
-        s = read_json(os.path.join(CLAUDE, "sessions", "%s.json" % pid))
-        if s and s.get("sessionId"):
-            p = os.path.join(CLAUDE, "projects", slug(s.get("cwd") or cwd), s["sessionId"] + ".jsonl")
-            if os.path.exists(p):
-                return p, s
-            # The session moved folders (worktree, cd): find it by id.
-            folder = os.path.join(CLAUDE, "projects")
-            for d in os.listdir(folder):
-                q = os.path.join(folder, d, s["sessionId"] + ".jsonl")
-                if os.path.exists(q):
-                    return q, s
+    s = session_in([int(pid)]) if str(pid).isdigit() else None
+    if s:
+        p = find_transcript(s["sessionId"], s.get("cwd") or cwd)
+        if p:
+            return p, s
     if given and os.path.exists(given):
         return given, None
     if cwd:
-        return newest(os.path.join(CLAUDE, "projects", slug(cwd))), None
+        return newest(os.path.join(PROJECTS, slug(cwd))), None
     return None, None
 
 
@@ -80,24 +56,6 @@ def clip(text, head=RESULT_HEAD, tail=RESULT_TAIL):
         return text
     cut = len(text) - head - tail
     return "%s\n… %d more characters …\n%s" % (text[:head], cut, text[-tail:])
-
-
-def save_image(block):
-    """An image block's picture as a file (named by its content, written once), or None."""
-    src = block.get("source") or {}
-    data = src.get("data")
-    if src.get("type") != "base64" or not isinstance(data, str):
-        return None
-    path = os.path.join(IMAGES, hashlib.sha1(data.encode()).hexdigest()[:20] + IMAGE_EXT.get(src.get("media_type"), ".png"))
-    if not os.path.exists(path):
-        try:
-            os.makedirs(IMAGES, exist_ok=True)
-            with open(path + ".part", "wb") as f:
-                f.write(base64.b64decode(data))
-            os.replace(path + ".part", path)
-        except (OSError, ValueError):
-            return None
-    return path
 
 
 def block_text(content):

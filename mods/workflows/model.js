@@ -4,9 +4,15 @@
 // parallel or in sequence, or the phase fans out: every item of a list flows through
 // the steps as pipeline stages. Prompts reference earlier results with {{steps.id.path}},
 // {{args.name}}, and inside a fan-out {{item}}, {{item.field}}, {{index}} and {{prev}}.
-// The compiled script carries the model on its last line so the editor can reopen it.
+// The compiled script carries the model on its last line so the editor can reopen it, and a
+// fingerprint of everything above it, so a hand edit shows.
+//
+// Code blocks hold what the model can't say: a code step is JavaScript that runs where an
+// agent would (it returns the step's result), a code phase is JavaScript that runs as the
+// whole phase, in the script's scope (R holds results, A the args).
 
-export const MODEL_MARK = "// @herdr-workflow ";
+const MODEL_MARK = "// @herdr-workflow ";
+const BODY_MARK = "// @herdr-body ";
 
 export const MODELS = [
   { id: "", label: "Inherit" },
@@ -20,7 +26,17 @@ export const MODES = [
   { id: "parallel", label: "Parallel", hint: "Steps run at the same time" },
   { id: "sequential", label: "Sequence", hint: "Steps run one after another" },
   { id: "fanout", label: "Fan-out", hint: "Each item of a list flows through the steps" },
+  { id: "code", label: "Code", hint: "Your own JavaScript runs as the phase" },
 ];
+
+export const CODE_STEP_STARTER = `// steps, args (and item, index, prev, round where they exist) are in scope;
+// agent(), parallel(), pipeline() and log() work as anywhere in a workflow.
+// What you return is this step's result.
+return null`;
+
+export const CODE_PHASE_STARTER = `// Runs as the whole phase. R holds earlier results (R.<step id>), A the args;
+// set R.<name> for later phases to read as {{steps.<name>}}.
+`;
 export const FIELD_TYPES = ["string", "number", "boolean", "string[]", "object[]", "object"];
 export const AGENT_TYPES = ["", "general-purpose", "Explore", "Plan"];
 export const WHENS = [
@@ -37,10 +53,10 @@ export const UNTIL_OPS = [
 export const MAX_ROUNDS = 20;
 
 /** A phase's loop: off by default; when on, its steps repeat until `until` holds or `max` rounds ran. */
-export const noLoop = () => ({ enabled: false, max: 3, until: { step: "", field: "", op: "truthy", value: "" } });
+const noLoop = () => ({ enabled: false, max: 3, until: { step: "", field: "", op: "truthy", value: "" } });
 
 let seq = 0;
-export const uid = prefix => `${prefix}${Date.now().toString(36)}${(seq++).toString(36)}`;
+const uid = prefix => `${prefix}${Date.now().toString(36)}${(seq++).toString(36)}`;
 
 export const slug = s =>
   String(s ?? "")
@@ -69,11 +85,17 @@ export function newStep(label = "step") {
     when: "always",
     files: [],
     output: { kind: "text", fields: [], raw: "" },
+    kind: "agent",
+    code: "",
   };
 }
 
+export function newCodeStep(label = "code") {
+  return { ...newStep(label), kind: "code", code: CODE_STEP_STARTER };
+}
+
 export function newPhase(title = "Phase") {
-  return { id: uid("p"), title, detail: "", mode: "parallel", source: "", itemKey: "id", loop: noLoop(), steps: [] };
+  return { id: uid("p"), title, detail: "", mode: "parallel", source: "", itemKey: "id", loop: noLoop(), steps: [], code: "" };
 }
 
 export function blankModel() {
@@ -103,6 +125,7 @@ export function normalize(input) {
     mode: MODES.some(x => x.id === p?.mode) ? p.mode : p?.mode === "pipeline" ? "fanout" : "parallel",
     source: String(p?.source || ""),
     itemKey: String(p?.itemKey ?? "id"),
+    code: String(p?.code || ""),
     loop: {
       enabled: Boolean(p?.loop?.enabled),
       max: Math.max(1, Math.min(MAX_ROUNDS, Math.round(Number(p?.loop?.max) || 3))),
@@ -113,7 +136,7 @@ export function normalize(input) {
         value: String(p?.loop?.until?.value ?? ""),
       },
     },
-    steps: (Array.isArray(p?.steps) ? p.steps : []).map(s => {
+    steps: (Array.isArray(p?.steps) && p?.mode !== "code" ? p.steps : []).map(s => {
       let id = ident(s?.id || slug(s?.label || "step").replace(/-/g, "_"));
       while (ids.has(id)) id = `${id}_2`;
       ids.add(id);
@@ -129,6 +152,8 @@ export function normalize(input) {
         isolation: Boolean(s?.isolation),
         repeat: Math.max(1, Math.min(32, Math.round(Number(s?.repeat) || 1))),
         when: WHENS.some(w => w.id === s?.when) ? s.when : "always",
+        kind: s?.kind === "code" ? "code" : "agent",
+        code: String(s?.code || ""),
         files: [...new Set((Array.isArray(s?.files) ? s.files : []).map(f => String(f).trim()).filter(Boolean))],
         output: {
           kind: ["text", "schema", "raw"].includes(out.kind) ? out.kind : out.fields?.length ? "schema" : "text",
@@ -198,7 +223,7 @@ export function refsIn(text) {
 }
 
 /** Steps whose results exist when `stepId` starts (earlier phases, earlier steps of a sequence). */
-export function visibleSteps(m, stepId) {
+function visibleSteps(m, stepId) {
   const out = [];
   for (const p of m.phases) {
     const i = p.steps.findIndex(s => s.id === stepId);
@@ -214,7 +239,7 @@ export function visibleSteps(m, stepId) {
 }
 
 /** Steps visible before a whole phase starts (what a fan-out may iterate). */
-export function stepsBefore(m, phaseId) {
+function stepsBefore(m, phaseId) {
   const out = [];
   for (const p of m.phases) {
     if (p.id === phaseId) break;
@@ -272,16 +297,25 @@ export function validate(m) {
   if (!m.phases.length) err(null, "Add at least one phase");
   const titles = new Set();
   const ids = new Set();
+  // After a code phase, a result the steps can't see may be one its code set on R.
+  let codeBefore = null;
+  const unseen = (t, msg, name) =>
+    codeBefore ? warn(t, `${msg}, unless the code in ${codeBefore} sets R.${name}`) : err(t, msg);
   for (const p of m.phases) {
     if (titles.has(p.title)) err({ phase: p.id }, `Two phases are called "${p.title}"`);
     titles.add(p.title);
+    if (p.mode === "code") {
+      if (!p.code.replace(/\/\/.*$/gm, "").trim()) err({ phase: p.id }, `${p.title} is a code phase with no code`);
+      codeBefore = p.title;
+      continue;
+    }
     if (!p.steps.length) err({ phase: p.id }, `${p.title} has no steps`);
     if (p.mode === "fanout") {
       if (!p.source.trim()) err({ phase: p.id }, `${p.title} fans out but has no list to iterate`);
       else {
         const [root, id] = p.source.split(".");
         if (root === "steps" && !stepsBefore(m, p.id).some(x => x.step.id === id))
-          err({ phase: p.id }, `${p.title} iterates ${p.source}, which isn't a step from an earlier phase`);
+          unseen({ phase: p.id }, `${p.title} iterates ${p.source}, which isn't a step from an earlier phase`, id);
         if (root === "args" && !m.args.some(a => a.name === id))
           err({ phase: p.id }, `${p.title} iterates unknown arg ${id}`);
         if (root !== "steps" && root !== "args")
@@ -292,11 +326,15 @@ export function validate(m) {
       const t = { phase: p.id, step: s.id };
       if (ids.has(s.id)) err(t, `Step id ${s.id} is used twice`);
       ids.add(s.id);
+      if (s.kind === "code") {
+        if (!s.code.replace(/\/\/.*$/gm, "").trim()) err(t, `${s.label} is a code step with no code`);
+        return;
+      }
       if (!s.prompt.trim()) err(t, `${s.label} has an empty prompt`);
       const visible = new Set(visibleSteps(m, s.id).map(x => x.step.id));
       for (const r of refsIn(s.prompt)) {
         const [root, name] = r.split(".");
-        if (root === "steps" && !visible.has(name)) err(t, `${s.label} uses {{${r}}} before that step has run`);
+        if (root === "steps" && !visible.has(name)) unseen(t, `${s.label} uses {{${r}}} before that step has run`, name);
         else if (root === "args" && !m.args.some(a => a.name === name)) err(t, `${s.label} uses unknown arg {{${r}}}`);
         else if (["item", "index"].includes(root) && p.mode !== "fanout")
           err(t, `{{${root}}} only exists inside a fan-out phase`);
@@ -331,7 +369,7 @@ export function validate(m) {
     });
   }
   for (const p of m.phases) {
-    if (!p.loop.enabled) continue;
+    if (!p.loop.enabled || p.mode === "code") continue;
     const u = p.loop.until;
     const step = p.steps.find(s => s.id === u.step);
     if (p.mode === "parallel" && p.steps.length > 1)
@@ -346,7 +384,7 @@ export function validate(m) {
       if (["equals", "contains"].includes(u.op) && !u.value.trim()) err({ phase: p.id }, `${p.title}: say what ${step.label} must ${u.op === "equals" ? "equal" : "contain"}`);
     }
   }
-  if (m.result && !ids.has(m.result)) err(null, `The result step ${m.result} doesn't exist`);
+  if (m.result && !ids.has(m.result)) unseen(null, `The result step ${m.result} doesn't exist`, m.result);
   return issues;
 }
 
@@ -365,7 +403,7 @@ function fieldSchema(f) {
   return f.description ? { ...base, description: f.description } : base;
 }
 
-export function schemaOf(step) {
+function schemaOf(step) {
   if (step.output.kind === "raw") {
     try {
       return JSON.parse(step.output.raw);
@@ -394,13 +432,20 @@ function options(m, phase, step, labelExpr) {
 }
 
 /** The prompt plus its attached files: paths the agent reads at run time (the script can't read files). */
-export function fullPrompt(step) {
+function fullPrompt(step) {
   if (!step.files?.length) return step.prompt;
   const list = step.files.map(f => `- ${f}`).join("\n");
   return `${step.prompt.trimEnd()}\n\nRead these files first (paths are relative to the repository root unless absolute):\n${list}`;
 }
 
+// Code blocks go in as written, never re-indented: a line inside a multi-line template
+// literal is part of its text.
+const verbatim = code => String(code).replace(/\s+$/, "");
+
 function call(m, phase, step, scope, labelExpr, indent) {
+  // A code step: its code as an async function of the same scope an agent's prompt gets.
+  if (step.kind === "code")
+    return `(async ({ steps, args, item, index, prev, round }) => {\n${verbatim(step.code)}\n${indent}})(${scope})`;
   const prompt = `fill(${tpl(fullPrompt(step))}, ${scope})`;
   if (step.repeat > 1) {
     const opts = options(m, phase, step, `${labelExpr} + '#' + (k + 1)`);
@@ -507,56 +552,86 @@ export function compile(m) {
       out.push(`//   ${a.name}${a.description ? ` — ${a.description}` : ""}${a.example ? ` (e.g. ${a.example})` : ""}`);
   }
   out.push(HELPERS);
-  if (m.phases.some(p => p.loop.enabled)) out.push(LOOP_HELPER);
+  if (m.phases.some(p => (p.loop.enabled && p.mode !== "code") || (p.mode === "code" && /\bholds\(/.test(p.code))))
+    out.push(LOOP_HELPER);
   out.push("const A = args ?? {}");
   out.push("const R = {}");
   for (const p of m.phases) {
     out.push("");
     out.push(`phase(${q(p.title)})`);
-    if (p.loop.enabled) {
-      if (p.mode === "fanout") loopFanout(m, p, out);
-      else loopPhase(m, p, out);
-    } else if (p.mode === "sequential") {
-      for (const s of p.steps) out.push(`R.${s.id} = await ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "")}`);
-    } else if (p.mode === "parallel") {
-      if (p.steps.length === 1) {
-        const s = p.steps[0];
-        out.push(`R.${s.id} = await ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "")}`);
-      } else {
-        out.push("{");
-        out.push("  const out = await parallel([");
-        for (const s of p.steps) out.push(`    () => ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "    ")},`);
-        out.push("  ])");
-        p.steps.forEach((s, i) => out.push(`  R.${s.id} = out[${i}]`));
-        out.push("}");
-      }
-    } else {
-      out.push("{");
-      out.push(`  const items = list(get({ steps: R, args: A }, ${q(p.source)}))`);
-      out.push(`  log(${tpl(`${p.title}: `)} + items.length + ' items')`);
-      out.push(`  const S = ${JSON.stringify(p.steps.map(() => []))}`);
-      out.push("  await pipeline(items,");
-      p.steps.forEach((s, i) => {
-        const scope = "{ steps: R, args: A, item, index, prev }";
-        const label = `${q(`${s.label}:`)} + keyOf(item, index, ${q(p.itemKey)})`;
-        out.push(
-          `    (prev, item, index) => ${call(m, p, s, scope, label, "    ")}.then((r) => ((S[${i}][index] = r), r)),`,
-        );
-      });
-      out.push("  )");
-      p.steps.forEach((s, i) => out.push(`  R.${s.id} = S[${i}]`));
-      out.push("}");
-    }
+    emitPhase(m, p, out);
   }
   out.push("");
   out.push(m.result ? `return R.${m.result}` : "return R");
   out.push("");
-  out.push(MODEL_MARK + JSON.stringify(m));
-  return out.join("\n") + "\n";
+  const body = out.join("\n") + "\n";
+  return `${body}${BODY_MARK}${fingerprint(body)}\n${MODEL_MARK}${JSON.stringify(m)}\n`;
 }
 
+/** The statements that run one phase, pushed onto `out`. */
+function emitPhase(m, p, out) {
+  if (p.mode === "code") {
+    out.push("{");
+    out.push(verbatim(p.code));
+    out.push("}");
+  } else if (p.loop.enabled) {
+    if (p.mode === "fanout") loopFanout(m, p, out);
+    else loopPhase(m, p, out);
+  } else if (p.mode === "sequential") {
+    for (const s of p.steps) out.push(`R.${s.id} = await ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "")}`);
+  } else if (p.mode === "parallel") {
+    if (p.steps.length === 1) {
+      const s = p.steps[0];
+      out.push(`R.${s.id} = await ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "")}`);
+    } else {
+      out.push("{");
+      out.push("  const out = await parallel([");
+      for (const s of p.steps) out.push(`    () => ${call(m, p, s, "{ steps: R, args: A }", q(s.label), "    ")},`);
+      out.push("  ])");
+      p.steps.forEach((s, i) => out.push(`  R.${s.id} = out[${i}]`));
+      out.push("}");
+    }
+  } else {
+    out.push("{");
+    out.push(`  const items = list(get({ steps: R, args: A }, ${q(p.source)}))`);
+    out.push(`  log(${tpl(`${p.title}: `)} + items.length + ' items')`);
+    out.push(`  const S = ${JSON.stringify(p.steps.map(() => []))}`);
+    out.push("  await pipeline(items,");
+    p.steps.forEach((s, i) => {
+      const scope = "{ steps: R, args: A, item, index, prev }";
+      const label = `${q(`${s.label}:`)} + keyOf(item, index, ${q(p.itemKey)})`;
+      out.push(
+        `    (prev, item, index) => ${call(m, p, s, scope, label, "    ")}.then((r) => ((S[${i}][index] = r), r)),`,
+      );
+    });
+    out.push("  )");
+    p.steps.forEach((s, i) => out.push(`  R.${s.id} = S[${i}]`));
+    out.push("}");
+  }
+}
+
+/** What a phase compiles to, as the code of a code phase (its outer block unwrapped). */
+export function phaseCode(m, p) {
+  const out = [];
+  emitPhase(m, { ...p, mode: p.mode === "code" ? "parallel" : p.mode }, out);
+  const lines = out.join("\n").split("\n");
+  return (lines[0] === "{" && lines[lines.length - 1] === "}" ? lines.slice(1, -1) : lines).join("\n") + "\n";
+}
+
+/** FNV-1a over the text's code points, as 8 hex digits (collect.py computes the same). */
+function fingerprint(text) {
+  let h = 0x811c9dc5;
+  for (const ch of String(text)) {
+    h = (h ^ ch.codePointAt(0)) >>> 0;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+const markLine = l => l.startsWith(MODEL_MARK) || l.startsWith(BODY_MARK);
+
 /** The model a compiled script carries, or null for a hand-written script. */
-export function extract(script) {
+function extract(script) {
   const line = String(script ?? "")
     .split("\n")
     .reverse()
@@ -569,9 +644,30 @@ export function extract(script) {
   }
 }
 
-/** Whether a script still matches the model it carries (no hand edits since). */
-export function untouched(script, model) {
-  return compile(model) === script;
+/**
+ * The design a script carries, and whether the script was edited by hand since it was
+ * compiled: `{ model, edited }`. Scripts saved before the fingerprint compare with a fresh
+ * compile instead.
+ */
+export function designOf(script) {
+  const text = String(script ?? "");
+  const model = extract(text);
+  if (!model) return { model: null, edited: false };
+  const lines = text.split("\n");
+  const mark = lines.find(l => l.startsWith(BODY_MARK));
+  const body = lines.filter(l => !markLine(l)).join("\n");
+  if (mark) return { model, edited: mark.slice(BODY_MARK.length).trim() !== fingerprint(body) };
+  const fresh = compile(model).split("\n").filter(l => !markLine(l)).join("\n");
+  return { model, edited: fresh !== body };
+}
+
+/** A design's script as a hand-written one: the same code without the design it carries. */
+export function asCode(model) {
+  return compile(model)
+    .split("\n")
+    .filter(l => !markLine(l))
+    .join("\n")
+    .replace(/\/\/ Built with the Herdr workflow editor\..*\n/, "");
 }
 
 /** What a hand-written script's meta says, for the graph of a code-only workflow. */
@@ -582,4 +678,14 @@ export function metaOf(script) {
     ...(s.match(/phases\s*:\s*\[([\s\S]*?)\]/)?.[1] ?? "").matchAll(/title\s*:\s*(['"`])((?:\\.|(?!\1).)*)\1/g),
   ].map(x => x[2]);
   return { name: pick("name"), description: pick("description"), phases };
+}
+
+/** "until review.clean is true", for a phase's loop. */
+export function stopText(p) {
+  const u = p.loop.until;
+  const step = p.steps.find(s => s.id === u.step);
+  if (!step) return "no stop condition yet";
+  const op = UNTIL_OPS.find(o => o.id === u.op)?.label ?? u.op;
+  const value = ["equals", "contains"].includes(u.op) ? ` "${u.value}"` : "";
+  return `until ${step.label}${u.field ? `.${u.field}` : ""} ${op}${value}`;
 }

@@ -22,7 +22,7 @@ export function graphDir() {
   return dir;
 }
 
-export function setGraphDir(d) {
+function setGraphDir(d) {
   dir = d === "v" ? "v" : "h";
   localStorage.setItem(DIR_KEY, dir);
 }
@@ -51,7 +51,7 @@ export function dirSwitch(t, id) {
  * `mid` and `entry` (where a not-started lane's placeholder is met); each node gets
  * `x`, `y`, `cx`, `cy`, `cross` (its center across the flow), `pin` and `pout`.
  */
-export function place(lanes, d = "h") {
+function place(lanes, d = "h") {
   const most = Math.max(1, ...lanes.map(l => l.nodes.length));
   if (d === "v") {
     const rowW = most * G.laneW + (most - 1) * G.colGap;
@@ -207,12 +207,159 @@ export function glyph(lk, t, size = 26) {
     .child(mark);
 }
 
-function laneChrome(lane, size, t) {
-  const total = lane.nodes.length || 1;
-  const pct = n => `${Math.round((n / total) * 100)}%`;
+// ---- shared card and lane frames: the run view, the editor's design and a script's graph
+// draw the same shells and differ only in what's inside.
+
+/** The 3px bar down a card's left edge, `inset` from its top and bottom. */
+function accentBar(color, inset, pulse) {
+  return div()
+    .absolute()
+    .left(0)
+    .top(inset)
+    .w(3)
+    .h(G.nodeH - inset * 2)
+    .rounded_full()
+    .bg(color)
+    .when(!!pulse, el => el.loop("opacity", { from: 0.25, to: 1, period: 1200 }));
+}
+
+/**
+ * A node's card, placed at the node: rounded, tinted and bordered in the accent when
+ * selected, and clicked by the node's id. `o`: `id`, `selected`, `onSelect(id, cx)`, `body`;
+ * optional `border` (the unselected border color), `dashed`, `shadow` (false: none unselected),
+ * `tint` (how much accent a selected card takes), `hoverBg` (the unselected hover fill), and
+ * `bar` `{ color, inset, pulse }` for the accent bar.
+ */
+export function cardShell(n, t, o) {
+  const selected = o.selected;
+  const tint = selected ? mix(t.background, t.accent, o.tint ?? 0.08) : t.background;
+  return div()
+    .id(o.id)
+    .absolute()
+    .left(n.x)
+    .top(n.y)
+    .w(G.laneW)
+    .h(G.nodeH)
+    .rounded(13)
+    .bg(tint)
+    .border(selected ? 1.5 : 1)
+    .when(!!o.dashed, el => el.border_dashed())
+    .border_color(selected ? t.accent : (o.border ?? t.border))
+    .when(selected, el => el.shadow_lg())
+    .when(!selected && o.shadow !== false, el => el.shadow_sm())
+    .cursor_pointer()
+    .hover(s => {
+      const st = s.border_color(selected ? t.accent : alpha(t.accent, 0.55));
+      return o.hoverBg ? st.bg(selected ? tint : o.hoverBg) : st;
+    })
+    .on_click((_e, cx) => o.onSelect(n.id, cx))
+    .when(!!o.bar, el => el.child(accentBar(o.bar.color, o.bar.inset ?? 12, o.bar.pulse)))
+    .child(o.body);
+}
+
+/** A card's two rows: the title line, and the line under it. */
+export function cardRows(top, bottom) {
+  return v_flex()
+    .size_full()
+    .pl(14)
+    .pr(12)
+    .py(10)
+    .gap(6)
+    .child(top)
+    .child(bottom);
+}
+
+/** A card standing for many (a fan-out): two offset frames behind each of `nodes`. */
+export function fanStacks(nodes, box, t) {
+  return nodes.flatMap(n =>
+    [8, 4].map(off =>
+      div()
+        .absolute()
+        .left(n.x - box.x + off)
+        .top(n.y - box.y + off)
+        .w(G.laneW)
+        .h(G.nodeH)
+        .rounded(13)
+        .border(1)
+        .border_color(alpha(t.accent, off === 8 ? 0.18 : 0.3))
+        .bg(t.background),
+    ),
+  );
+}
+
+/** A dashed outline `w`×`h` where a card would be, with `label` centered in it, if any. */
+export function placeholder(t, w, h, radius, label) {
+  return div()
+    .w(w)
+    .h(h)
+    .rounded(radius)
+    .border(1)
+    .border_color(alpha(t.muted, 0.35))
+    .border_dashed()
+    .when(!!label, el =>
+      el
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().text_size(11).text_color(t.dim).child(label)),
+    );
+}
+
+/**
+ * A lane's frame and header: the index and title (then `o.trail`, its badges) over `o.rows`.
+ * Left to right the header sits on top; top to bottom it's a column beside the row, so edges
+ * reach node tops clear of it. `o`: `gap`, `pt` (the header's spacing), `indexColor`; optional
+ * `id`, `selected`, `behind` (drawn under the header: stacks, arrows), `empty` (drawn last),
+ * and `headId` with `onHead(cx)` to make the header clickable.
+ */
+export function laneShell(lane, size, t, o) {
   const v = size.dir === "v";
   const box = lane.box;
-  return div()
+  let head = v_flex();
+  if (o.headId) head = head.id(o.headId);
+  head = head
+    .px(14)
+    .gap(o.gap)
+    .when(!v, el => el.pt(o.pt))
+    .when(v, el =>
+      el
+        .absolute()
+        .left(0)
+        .top(0)
+        .w(G.headW)
+        .h(box.h)
+        .justify_center()
+        .border_r(1)
+        .border_color(alpha(t.border, 0.4)),
+    )
+    .when(!!o.onHead, el => el.cursor_pointer().on_click((_e, cx) => o.onHead(cx)))
+    .child(
+      h_flex()
+        .items_center()
+        .gap(8)
+        .child(
+          div()
+            .font_family(mono())
+            .text_size(10.5)
+            .text_color(o.indexColor)
+            .child(String(lane.index).padStart(2, "0")),
+        )
+        .child(
+          div()
+            .flex_1()
+            .min_w(0)
+            .truncate()
+            .text_size(13)
+            .font_semibold()
+            .text_color(t.foreground)
+            .child(lane.title),
+        )
+        .children(o.trail ?? []),
+    )
+    .children(o.rows ?? []);
+  let frame = div();
+  if (o.id) frame = frame.id(o.id);
+  return frame
     .absolute()
     .left(box.x)
     .top(box.y)
@@ -220,99 +367,59 @@ function laneChrome(lane, size, t) {
     .h(box.h)
     .rounded(18)
     .bg(alpha(t.foreground, 0.022))
-    .border(1)
-    .border_color(alpha(t.border, 0.55))
-    .child(
-      v_flex()
-        .px(14)
-        .gap(9)
-        .when(!v, el => el.pt(14))
-        // Top to bottom: the header is a column beside the row, so edges reach node tops clear of it.
-        .when(v, el =>
-          el
-            .absolute()
-            .left(0)
-            .top(0)
-            .w(G.headW)
-            .h(box.h)
-            .justify_center()
-            .border_r(1)
-            .border_color(alpha(t.border, 0.4)),
-        )
-        .child(
-          h_flex()
-            .items_center()
-            .gap(8)
-            .child(
-              div()
-                .font_family(mono())
-                .text_size(10.5)
-                .text_color(lane.look.color)
-                .child(String(lane.index).padStart(2, "0")),
-            )
-            .child(
-              div()
-                .flex_1()
-                .min_w(0)
-                .truncate()
-                .text_size(13)
-                .font_semibold()
-                .text_color(t.foreground)
-                .child(lane.title),
-            )
-            .child(
-              div()
-                .font_family(mono())
-                .text_size(10.5)
-                .text_color(t.muted)
-                .child(lane.nodes.length ? `${lane.done}/${lane.nodes.length}` : "—"),
-            ),
-        )
-        .child(
-          h_flex()
-            .h(3)
-            .w_full()
-            .rounded_full()
-            .overflow_hidden()
-            .bg(alpha(t.foreground, 0.07))
-            .child(
-              div().h_full().w(pct(lane.done)).bg(ok(t)).transition("width", { duration: 400, easing: "ease-out" }),
-            )
-            .child(div().h_full().w(pct(lane.failed)).bg(t.blocked))
-            .child(div().h_full().w(pct(lane.live)).bg(t.working).loop("opacity", { from: 0.4, to: 1, period: 1200 })),
-        ),
-    )
-    .when(!lane.nodes.length && v, el =>
-      el.child(
-        div()
+    .border(o.selected ? 1.5 : 1)
+    .border_color(o.selected ? t.accent : alpha(t.border, 0.55))
+    .children(o.behind ?? [])
+    .child(head)
+    .when(!!o.empty, el => el.child(o.empty));
+}
+
+function laneChrome(lane, size, t) {
+  const total = lane.nodes.length || 1;
+  const pct = n => `${Math.round((n / total) * 100)}%`;
+  const v = size.dir === "v";
+  const empty = !lane.nodes.length
+    ? v
+      ? placeholder(t, G.laneW - 40, G.nodeH, 13, "Not started")
           .absolute()
           .left(lane.slot.x + (lane.slot.w - (G.laneW - 40)) / 2)
           .top(lane.slot.y)
-          .w(G.laneW - 40)
-          .h(G.nodeH)
-          .rounded(13)
-          .border(1)
-          .border_color(alpha(t.muted, 0.35))
-          .border_dashed()
-          .flex()
-          .items_center()
-          .justify_center()
-          .child(div().text_size(11).text_color(t.dim).child("Not started")),
-      ),
-    )
-    .when(!lane.nodes.length && !v, el =>
-      el.child(
-        v_flex()
+      : v_flex()
           .absolute()
           .left(0)
           .top(G.head + 8)
           .w_full()
           .items_center()
           .gap(8)
-          .child(div().w(G.laneW - 40).h(G.nodeH).rounded(13).border(1).border_color(alpha(t.muted, 0.35)).border_dashed())
-          .child(div().text_size(11).text_color(t.dim).child("Not started")),
-      ),
-    );
+          .child(placeholder(t, G.laneW - 40, G.nodeH, 13))
+          .child(div().text_size(11).text_color(t.dim).child("Not started"))
+    : null;
+  return laneShell(lane, size, t, {
+    gap: 9,
+    pt: 14,
+    indexColor: lane.look.color,
+    trail: [
+      div()
+        .font_family(mono())
+        .text_size(10.5)
+        .text_color(t.muted)
+        .child(lane.nodes.length ? `${lane.done}/${lane.nodes.length}` : "—"),
+    ],
+    rows: [
+      h_flex()
+        .h(3)
+        .w_full()
+        .rounded_full()
+        .overflow_hidden()
+        .bg(alpha(t.foreground, 0.07))
+        .child(
+          div().h_full().w(pct(lane.done)).bg(ok(t)).transition("width", { duration: 400, easing: "ease-out" }),
+        )
+        .child(div().h_full().w(pct(lane.failed)).bg(t.blocked))
+        .child(div().h_full().w(pct(lane.live)).bg(t.working).loop("opacity", { from: 0.4, to: 1, period: 1200 })),
+    ],
+    empty,
+  });
 }
 
 function port(x, y, color, t, id) {
@@ -346,7 +453,6 @@ function pill(text, t) {
 
 function nodeCard(n, t, selected, onSelect) {
   const lk = n.look;
-  const tint = selected ? mix(t.background, t.accent, 0.1) : t.background;
   // One dot per session in its kind's color; a failed or live session shows its state instead.
   const dots = n.kinds.slice(-9).map((k, i) =>
     div()
@@ -365,88 +471,62 @@ function nodeCard(n, t, selected, onSelect) {
       : lk.key === "failed"
         ? alpha(t.blocked, 0.55)
         : t.border;
-  return div()
-    .id(`node-${n.id}`)
-    .absolute()
-    .left(n.x)
-    .top(n.y)
-    .w(G.laneW)
-    .h(G.nodeH)
-    .rounded(13)
-    .bg(tint)
-    .border(selected ? 1.5 : 1)
-    .border_color(border)
-    .when(selected, el => el.shadow_lg())
-    .when(!selected, el => el.shadow_sm())
-    .cursor_pointer()
-    .hover(s =>
-      s
-        .border_color(selected ? t.accent : alpha(t.accent, 0.55))
-        .bg(selected ? tint : mix(t.background, t.foreground, 0.03)),
-    )
-    .on_click((_e, cx) => onSelect(n.id, cx))
-    .when(lk.key === "running", el =>
-      el.child(
-        div()
-          .absolute()
-          .left(0)
-          .top(14)
-          .w(3)
-          .h(G.nodeH - 28)
-          .rounded_full()
-          .bg(t.working)
-          .loop("opacity", { from: 0.25, to: 1, period: 1200 }),
+  return cardShell(n, t, {
+    id: `node-${n.id}`,
+    selected,
+    onSelect,
+    border,
+    tint: 0.1,
+    hoverBg: mix(t.background, t.foreground, 0.03),
+    bar: lk.key === "running" ? { color: t.working, inset: 14, pulse: true } : null,
+    body: h_flex()
+      .size_full()
+      .pl(13)
+      .pr(12)
+      .gap(11)
+      .items_center()
+      .child(glyph(lk, t, 28))
+      .child(
+        v_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(7)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .truncate()
+                  .text_size(13.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(n.title),
+              )
+              .when(n.sessions.length > 1, el => el.child(pill(`×${n.sessions.length}`, t))),
+          )
+          .child(
+            h_flex()
+              .gap(7)
+              .items_center()
+              .child(h_flex().flex_none().gap(3).items_center().children(dots))
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .truncate()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child(kinds.length ? kinds.join(" · ") : n.cached ? "cached" : lk.label.toLowerCase()),
+              )
+              .when(n.models.length > 0, el =>
+                el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(n.models.join(" · "))),
+              ),
+          ),
       ),
-    )
-    .child(
-      h_flex()
-        .size_full()
-        .pl(13)
-        .pr(12)
-        .gap(11)
-        .items_center()
-        .child(glyph(lk, t, 28))
-        .child(
-          v_flex()
-            .flex_1()
-            .min_w(0)
-            .gap(7)
-            .child(
-              h_flex()
-                .gap(6)
-                .items_center()
-                .child(
-                  div()
-                    .flex_1()
-                    .min_w(0)
-                    .truncate()
-                    .text_size(13.5)
-                    .font_semibold()
-                    .text_color(t.foreground)
-                    .child(n.title),
-                )
-                .when(n.sessions.length > 1, el => el.child(pill(`×${n.sessions.length}`, t))),
-            )
-            .child(
-              h_flex()
-                .gap(7)
-                .items_center()
-                .child(h_flex().flex_none().gap(3).items_center().children(dots))
-                .child(
-                  div()
-                    .flex_1()
-                    .min_w(0)
-                    .truncate()
-                    .text_size(11)
-                    .text_color(t.muted)
-                    .child(kinds.length ? kinds.join(" · ") : n.cached ? "cached" : lk.label.toLowerCase()),
-                )
-                .when(n.models.length > 0, el =>
-                  el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(n.models.join(" · "))),
-                ),
-            ),
-        ),
-    );
+  });
 }
 
 /**

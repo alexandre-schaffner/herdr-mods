@@ -91,7 +91,13 @@ function row(t, w, ui) {
             .gap(8)
             .items_center()
             .child(div().font_family(mono()).text_size(13).font_semibold().text_color(t.foreground).child(`/${w.name}`))
-            .child(badge(t, w.editable ? "designed" : "code", w.editable ? t.accent : t.muted))
+            .child(
+              badge(
+                t,
+                w.editable ? "designed" : w.edited ? "designed · edited by hand" : "code",
+                w.editable ? t.accent : w.edited ? (t.ansi3 ?? t.muted) : t.muted,
+              ),
+            )
             .child(
               div()
                 .text_size(11)

@@ -3,31 +3,15 @@
 
 import { div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, TextView } from "gpui-base";
-import { settings } from "herdr";
 import { family, toolName, toolLine, groupLine, fmtDuration, fmtTime, shortPath } from "./model.js";
-import { openLink, openViewer, viewable } from "./viewer.js";
+import { openLink, openViewer, viewable } from "./shared/viewer-link.js";
+import { alpha, dark, ICON, icon, mix, mono, ok } from "./shared/look.js";
+
+export { alpha, ICON, icon, mix, mono };
 
 export const COLUMN = 860;
-export const ICON = (name) => `mods/claude-reader/icons/${name}.svg`;
-export const icon = (name, size, color) => svg(ICON(name)).flex_none().w(size).h(size).text_color(color);
-export const mono = () => settings()?.font_family || settings()?.font || "JetBrains Mono";
 export const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-export function alpha(hex, a) {
-  const c = hex ?? "#888888";
-  const own = c.length >= 9 ? parseInt(c.slice(7, 9), 16) / 255 : 1;
-  const v = Math.round(Math.max(0, Math.min(1, a * own)) * 255);
-  return `${c.slice(0, 7)}${v.toString(16).padStart(2, "0")}`;
-}
-
-export function mix(a, b, t) {
-  const p = (h) => [1, 3, 5].map((i) => Number.parseInt((h ?? "#000000").slice(i, i + 2), 16));
-  const [x, y] = [p(a), p(b)];
-  return `#${x.map((v, i) => Math.round(v + (y[i] - v) * t).toString(16).padStart(2, "0")).join("")}`;
-}
-
-const dark = () => settings()?.dark !== false;
-const ok = (t) => t.ansi2 ?? t.done;
 /** Claude's orange, kept recognisable on any theme. */
 export const claudeColor = () => (dark() ? "#d97757" : "#c15f3c");
 

@@ -5,6 +5,8 @@ import { spaces, panes, run, openOverlay, theme, window, shared, layout, setting
 // Each side panel keeps its own width: Workflows needs room for its graph and drawer,
 // Files and Changes stay narrow.
 const PANEL_W = { files: 368, changes: 368, workflows: 900 };
+// The terminals beside the panel keep at least this much room.
+const MAIN_MIN = 320;
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -19,10 +21,12 @@ export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null;
     // "my-tabs.files" / ".changes" / ".workflows" (keys, other mods) open that panel.
-    cx.spawn(async () => {
+    // Uses its cx each time round, so a reload ends the old build's loop.
+    cx.spawn(async cx => {
       for (;;) {
         const c = await nextCommand();
         if (PANEL_W[c]) this.openPanel(c);
+        cx.notify();
       }
     });
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
@@ -31,7 +35,18 @@ export default class Tabs extends View {
   }
 
   width(id) {
-    return this.widths[id] ?? PANEL_W[id] ?? 368;
+    return this.fit(this.widths[id] ?? PANEL_W[id] ?? 368);
+  }
+
+  /** `px` limited to what the window has beside the sidebar and MAIN_MIN of terminals, and to
+   *  the panel's own min/max: Herdr applies a saved or requested width as is, even one wider
+   *  than the window, which pushes the panel off screen. */
+  fit(px) {
+    const panel = find(layout(), "panel");
+    // This bar spans the work area that the panel and the terminals share.
+    const room = this.barWidth ? this.barWidth - MAIN_MIN - 24 : Infinity;
+    const max = Math.min(panel?.max ?? Infinity, room);
+    return Math.round(Math.max(panel?.min ?? 280, Math.min(px, max)));
   }
 
   /** Shows panel `id` at its own width. */
@@ -48,6 +63,15 @@ export default class Tabs extends View {
     if (!panel || panel.hidden || !body?.active) return;
     const px = panel.size?.px;
     if (!px) return;
+    // Too wide for the window (a saved width, a smaller screen, a zoom): bring it back in.
+    const fits = this.fit(px);
+    if (px > fits + 1) {
+      if (!this.sizing || Date.now() >= this.sizing.until) {
+        this.sizing = { id: body.active, px: fits, until: Date.now() + 1000 };
+        run("layout.resize", { id: "panel", px: fits });
+      }
+      return;
+    }
     if (this.sizing) {
       if (body.active !== this.sizing.id || Math.abs(px - this.sizing.px) > 1) {
         if (Date.now() < this.sizing.until) return;
@@ -119,7 +143,9 @@ export default class Tabs extends View {
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
-    const enabled = [...new Set([...(shared("workspace.panels") ?? ["files", "changes"]), "workflows"])];
+    // Workflows is offered wherever this layout has its panel block.
+    const withWorkflows = Boolean(body?.children?.some(c => c.id === "workflows"));
+    const enabled = [...new Set([...(shared("workspace.panels") ?? ["files", "changes"]), ...(withWorkflows ? ["workflows"] : [])])];
     this.syncPanel(space, panel, body, enabled);
     this.noteWidth(panel, body);
     const panelButton = (id, label, icon) => {
@@ -132,14 +158,18 @@ export default class Tabs extends View {
           else this.openPanel(id);
         }).child(svg(icon).size(14)).child(label);
     };
-    return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+    return h_flex().id("tabs-root").on_size_change((size, cx) => {
+        if (Math.abs((this.barWidth ?? 0) - size.width) < 1) return;
+        this.barWidth = size.width;
+        cx.notify();
+      }).size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().children(shown.map(item)))
-      .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
+      .child(button("tab-new", "+", () => openOverlay({ mod: "my-new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
-      .when(enabled.includes("workflows"), el => el.child(panelButton("workflows", "Workflows", "mods/workflows/icons/flow.svg")))
+      .when(enabled.includes("workflows"), el => el.child(panelButton("workflows", "Workflows", "shared/icons/flow.svg")))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/my-tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/my-tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/my-tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))));

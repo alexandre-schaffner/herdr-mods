@@ -1,0 +1,29 @@
+{
+  "notes": [
+    "The Claude accounts, models and efforts the picker offers (read by claude-picker and my-pane).",
+    "An account is the environment Claude starts with: `unset` removes variables (fish exports ANTHROPIC_API_KEY, which wins over a login), `env` sets them (\"~/\" is that machine's home).",
+    "A separate login lives in its own CLAUDE_CONFIG_DIR. ~/.claude-personal links settings, skills, plugins, rules and projects to ~/.claude, so only the login differs.",
+    "`plain`: what a `claude` started outside the picker runs as. Model/effort value \"\" = Claude's default (no flag; /model default, /effort auto live)."
+  ],
+  "accounts": [
+    { "id": "merkl", "name": "Merkl", "detail": "work subscription · ~/.claude", "unset": ["ANTHROPIC_API_KEY"] },
+    { "id": "personal", "name": "Personal", "detail": "subscription · ~/.claude-personal", "unset": ["ANTHROPIC_API_KEY"], "env": { "CLAUDE_CONFIG_DIR": "~/.claude-personal" } },
+    { "id": "api", "name": "API key", "detail": "ANTHROPIC_API_KEY · usage billing" }
+  ],
+  "plain": "api",
+  "models": [
+    { "value": "", "name": "Default" },
+    { "value": "fable", "name": "Fable" },
+    { "value": "opus", "name": "Opus" },
+    { "value": "sonnet", "name": "Sonnet" },
+    { "value": "haiku", "name": "Haiku" }
+  ],
+  "efforts": [
+    { "value": "", "name": "Auto" },
+    { "value": "low", "name": "Low" },
+    { "value": "medium", "name": "Medium" },
+    { "value": "high", "name": "High" },
+    { "value": "xhigh", "name": "XHigh" },
+    { "value": "max", "name": "Max" }
+  ]
+}

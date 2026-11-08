@@ -3,10 +3,18 @@
 /*
 !/.gitignore
 !/README.md
+!/keys.json
+!/shared/
 
 !/mods/
 /mods/*
+!/mods/claude-picker/
 !/mods/claude-reader/
+!/mods/master/
+!/mods/my-new-menu/
+!/mods/my-pane/
+!/mods/my-spaces/
+!/mods/my-spaces-group/
 !/mods/my-tabs/
 !/mods/viewer/
 !/mods/workflows/

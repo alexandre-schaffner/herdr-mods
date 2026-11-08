@@ -56,9 +56,18 @@ def tool(name):
     return None
 
 
+# Herdr's exec stops a command after 30 s: every step shares this budget, and anything that
+# doesn't fit is left for the next call (staged files only appear once complete).
+DEADLINE = time.time() + 25
+
+
+def left():
+    return DEADLINE - time.time()
+
+
 def run(argv, timeout=60):
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=max(1, min(timeout, left())))
     except subprocess.TimeoutExpired:
         raise Fail("%s took too long" % os.path.basename(argv[0]))
     if r.returncode != 0:
@@ -228,6 +237,8 @@ def cmd_video(path):
             os.makedirs(work, exist_ok=True)
             try:
                 for i, t in enumerate(times):
+                    if left() < 4:  # no time for the sheet now: the next open makes it
+                        return info
                     grab(ffmpeg, path, t, TILE_WIDTH, os.path.join(work, "%02d.jpg" % i))
                 run([ffmpeg, "-v", "error", "-y", "-i", os.path.join(work, "%02d.jpg"),
                      "-vf", "tile=%dx%d" % (BOARD_COLS, BOARD_ROWS), "-frames:v", "1", "-q:v", "3", board + ".part.jpg"])
@@ -257,7 +268,8 @@ def cmd_play(path, start):
 
 
 def pdf_helper():
-    """The PDFKit renderer, compiled once per version of pdf.swift."""
+    """The PDFKit renderer, compiled once per version of pdf.swift. The compile runs on its
+    own (it can outlast this call) and the binary only appears, renamed, once it is whole."""
     src = os.path.join(HERE, "pdf.swift")
     with open(src, "rb") as f:
         ver = hashlib.sha1(f.read()).hexdigest()[:12]
@@ -267,11 +279,24 @@ def pdf_helper():
     swiftc = tool("swiftc")
     if not swiftc:
         return None
-    os.makedirs(os.path.dirname(exe), exist_ok=True)
-    for old in os.listdir(os.path.dirname(exe)):
-        os.remove(os.path.join(os.path.dirname(exe), old))
-    run([swiftc, "-O", src, "-o", exe], timeout=180)
-    return exe
+    bindir = os.path.dirname(exe)
+    os.makedirs(bindir, exist_ok=True)
+    lock = exe + ".building"
+    if not os.path.exists(lock) or time.time() - os.path.getmtime(lock) > 300:
+        for old in os.listdir(bindir):
+            if not old.startswith("pdf-" + ver):
+                os.remove(os.path.join(bindir, old))
+        open(lock, "w").close()
+        subprocess.Popen(["sh", "-c", '"$1" -O "$2" -o "$3.part" && mv "$3.part" "$3"; rm -f "$3.part" "$3.building"',
+                          "sh", swiftc, src, exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    while left() > 6 and os.path.exists(lock) and not os.access(exe, os.X_OK):
+        time.sleep(0.5)
+    if os.access(exe, os.X_OK):
+        return exe
+    if tool("pdfinfo"):
+        return None  # poppler meanwhile
+    raise Fail("Preparing the PDF renderer (first use); open it again in a moment")
 
 
 def cmd_pdf(path):

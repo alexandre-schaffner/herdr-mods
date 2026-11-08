@@ -15,12 +15,11 @@ import {
   look,
   mix,
   mono,
-  ok,
   scrollArea,
-  sessionSpan,
   shortModel,
 } from "./util.js";
-import { openLink } from "./viewer.js";
+import { sessionSpan } from "./runs.js";
+import { openLink } from "./shared/viewer-link.js";
 
 export const DRAWER_W = 460;
 

@@ -5,11 +5,12 @@ import { h_flex, Scrollbar, v_flex, v_virtual_list } from "gpui-base";
 import { div } from "gpui-kit";
 import { closeOverlay, home, openOverlay, panes, props, run, spaces } from "herdr";
 import { glyph } from "./graph.js";
+import { splitLabel } from "./runs.js";
 import { btn, iconBtn, seg } from "./ui.js";
-import { ago, alpha, duration, icon, kindColor, look, mix, mono, ok, scrollArea, splitLabel, tildify } from "./util.js";
+import { ago, alpha, duration, icon, kindColor, look, mix, mono, ok, scrollArea, tildify } from "./util.js";
 
 /** px per terminal line; every line is one, so the list can be virtual. */
-export const LH = 18;
+const LH = 18;
 const FONT = 12;
 const CHAR_W = FONT * 0.6;
 const RAIL_W = 292;
@@ -137,7 +138,7 @@ function promptDir(path, homeDir) {
  * The shell as lines `{ key, segs: [{ text, tone }], stamp?, prompt?, since? }`, wrapped at
  * `o.cols`. `o.filter` "shell" keeps commands; "all" adds every other tool as one line.
  */
-export function shellLines(data, o) {
+function shellLines(data, o) {
   const lines = [];
   const push = (key, segs, extra) => lines.push({ key, segs, ...extra });
   const entries = (data?.entries ?? []).filter(e => o.filter === "all" || e.kind === "bash");
@@ -300,13 +301,13 @@ function sessionCard(t, run, ui) {
       h_flex()
         .gap(10)
         .items_center()
-        .child(tile("terminal", p.session.alive ? t.accent : t.dim, 30))
+        .child(tile(p.master ? "crown" : "terminal", p.session.alive ? t.accent : t.dim, 30))
         .child(
           v_flex()
             .flex_1()
             .min_w(0)
             .gap(2)
-            .child(div().text_size(12.5).font_semibold().text_color(t.foreground).truncate().child(p.session.name || "Claude Code"))
+            .child(div().text_size(12.5).font_semibold().text_color(t.foreground).truncate().child(p.master ? `Master chat${p.session.name ? ` · ${p.session.name}` : ""}` : p.session.name || "Claude Code"))
             .child(
               div()
                 .font_family(mono())
@@ -339,11 +340,18 @@ function sessionCard(t, run, ui) {
         .text_color(t.muted)
         .child(
           !p.session.alive
-            ? `The session that ran this workflow has ended. \`${p.openCommand}\` reopens it.`
+            ? p.master
+              ? "The repository's master chat owns this run and has ended. Reopening brings it back in its Master tab."
+              : `The session that ran this workflow has ended. \`${p.openCommand}\` reopens it.`
             : term
-              ? "The Claude Code session running this workflow. Its agents work inside it."
+              ? p.master
+                ? "The repository's master chat owns this run. Its agents work inside it."
+                : "The Claude Code session running this workflow. Its agents work inside it."
               : "The session is alive, but no Herdr terminal shows it.",
         ),
+    )
+    .when(!p.session.alive, el =>
+      el.child(h_flex().child(btn(t, "term-reopen", p.master ? "Reopen the master chat" : "Reopen its session", cx => ui.onReopenOwner(cx), { kind: "primary", size: "sm", icon: "play" }))),
     )
     .when(p.session.alive && !!term, el =>
       el.child(
