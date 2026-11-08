@@ -82,6 +82,9 @@ def slim_input(name, inp):
     for k, v in inp.items():
         if k in ("content", "old_string", "new_string"):
             out[k] = clip(v if isinstance(v, str) else json.dumps(v), 6000, 1200)
+        elif k == "todos" and isinstance(v, list):
+            out[k] = [{"content": clip(str(x.get("content", "")), 300, 0), "activeForm": clip(str(x.get("activeForm", "")), 300, 0),
+                       "status": x.get("status")} for x in v[:60] if isinstance(x, dict)]
         elif k == "edits" and isinstance(v, list):
             out[k] = [
                 {"old_string": clip(e.get("old_string", ""), 3000, 600), "new_string": clip(e.get("new_string", ""), 3000, 600)}
@@ -210,6 +213,8 @@ def parse(line, ev, meta):
         user_events(o, ev)
     elif t == "assistant":
         assistant_events(o, ev, meta)
+    elif t == "permission-mode" and o.get("permissionMode"):
+        meta["permissionMode"] = o["permissionMode"]
     elif t == "ai-title":
         meta["ai_title"] = o.get("aiTitle")
     elif t == "custom-title":

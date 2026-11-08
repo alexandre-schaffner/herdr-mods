@@ -1,4 +1,5 @@
-// Transcript events (from read.py) → the rows the reader shows.
+// Transcript events (from claude-reader/read.py) → the rows a Claude chat shows, plus the
+// live facts beside them (todo list, background work).
 
 const HOME_RE = /^\/(?:Users|home)\/[^/]+/;
 
@@ -271,4 +272,49 @@ export function toMarkdown(state, title, cwd) {
   }
   flushTools();
   return out.join("\n");
+}
+
+/**
+ * The session's todo list, as Claude Code keeps it: the latest TodoWrite's list, or the tasks
+ * TaskCreate made and TaskUpdate moved since. `[{ id, text, status }]`, status one of
+ * pending | in_progress | completed. Empty when the session never kept one.
+ */
+export function todosOf(state) {
+  let list = [];
+  const tasks = new Map();
+  let created = 0;
+  for (const e of state.events) {
+    if (e.k !== "tool") continue;
+    const i = e.input ?? {};
+    if (e.name === "TodoWrite" && Array.isArray(i.todos)) {
+      list = i.todos.map((x, n) => ({ id: String(n), text: x.status === "in_progress" ? (x.activeForm || x.content) : x.content, status: x.status }));
+      tasks.clear();
+    } else if (e.name === "TaskCreate") {
+      const res = state.results.get(e.id);
+      const id = res?.text?.match(/#?(\d+)/)?.[1] ?? String(++created);
+      tasks.set(id, { id, text: i.subject ?? i.description ?? "Task", status: "pending" });
+    } else if (e.name === "TaskUpdate") {
+      const id = String(i.taskId ?? i.id ?? "");
+      const cur = tasks.get(id);
+      if (cur) tasks.set(id, { ...cur, status: i.status ?? cur.status, text: i.subject ?? cur.text });
+    }
+  }
+  return tasks.size ? [...tasks.values()].filter((x) => x.status !== "deleted") : list;
+}
+
+/**
+ * Work the session started in the background (Bash or Agent with run_in_background) and
+ * whether it has reported back: a task notification naming it, or a result that says it ended.
+ */
+export function backgroundOf(state) {
+  const notes = state.events.filter((e) => e.k === "note" && e.kind === "task");
+  const out = [];
+  for (const e of state.tools.values()) {
+    const i = e.input ?? {};
+    if (!i.run_in_background) continue;
+    const label = i.description || firstLine(i.command ?? i.prompt ?? e.name, 80);
+    const done = notes.some((n) => n.ts >= e.ts && label && n.text.includes(label.slice(0, 40)));
+    out.push({ id: e.id, kind: e.name === "Bash" ? "shell" : "agent", label, ts: e.ts, done });
+  }
+  return out.slice(-12);
 }

@@ -8,9 +8,11 @@ cd "$(dirname "$0")/.."
 
 MANIFEST="
 workflows      look.js media-kinds.js viewer-link.js
-claude-reader  look.js media-kinds.js viewer-link.js
+claude-reader  look.js media-kinds.js viewer-link.js claude-model.js claude-rows.js claude-chat.js
 claude-picker  claude-state.js
 my-pane        claude-state.js
+hq             look.js media-kinds.js viewer-link.js claude-model.js claude-rows.js claude-chat.js proxy-ui.js proxy-views.js
+proxy          look.js proxy-ui.js proxy-views.js
 "
 
 stale=0

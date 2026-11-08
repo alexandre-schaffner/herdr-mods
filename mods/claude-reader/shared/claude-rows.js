@@ -1,11 +1,13 @@
-// How each row looks. `ctx` carries the live facts (results, running tool) and the
+// Generated from shared/js/claude-rows.js by shared/sync.sh: edit it there.
+
+// How each row of a Claude chat looks. `ctx` carries the live facts (results, running tool) and the
 // handlers rows call: ctx.isOpen(key, byDefault), ctx.toggle(key, cx), ctx.copy(text, cx).
 
 import { div, svg, image } from "gpui-kit";
 import { h_flex, v_flex, TextView } from "gpui-base";
-import { family, toolName, toolLine, groupLine, fmtDuration, fmtTime, shortPath } from "./model.js";
-import { openLink, openViewer, viewable } from "./shared/viewer-link.js";
-import { alpha, dark, ICON, icon, mix, mono, ok } from "./shared/look.js";
+import { family, toolName, toolLine, groupLine, fmtDuration, fmtTime, shortPath } from "./claude-model.js";
+import { openLink, openViewer, viewable } from "./viewer-link.js";
+import { alpha, dark, ICON, icon, mix, mono, ok } from "./look.js";
 
 export { alpha, ICON, icon, mix, mono };
 
@@ -505,10 +507,39 @@ export function groupRow(t, row, ctx) {
 
 export function promptRow(t, row, ctx) {
   const e = row.ev;
-  const badges = [];
-  if (e.queued) badges.push(badge(t, "sent while working", t.working));
+  // A message another terminal sent with `hc send` arrives wrapped in <hc from="t7">…</hc>:
+  // show who sent it instead of "You", and only what it said.
+  const relayed = /^\s*<hc from="([^"]+)">([\s\S]*?)(?:<\/hc>)?\s*$/.exec(e.text ?? "");
+  const text = relayed ? relayed[2].trim() : e.text;
   const files = e.files ?? [];
+  const badges = [];
+  // Relayed messages always land mid-turn; the badge only means something on the person's own.
+  if (e.queued && !relayed) badges.push(badge(t, "queued", t.muted));
   if (e.images && !files.length) badges.push(badge(t, `${e.images} image${e.images > 1 ? "s" : ""}`, t.muted));
+  if (relayed) {
+    // Another agent reporting in: a quiet block, sender first, so it reads as a note in the log.
+    return column(
+      v_flex()
+        .id(`prompt-${row.key}`)
+        .w_full()
+        .gap(5)
+        .px(12)
+        .py(9)
+        .rounded(8)
+        .bg(alpha(t.foreground, 0.035))
+        .on_mouse_down("right", (_e, cx) => ctx.copy(text, cx))
+        .child(
+          h_flex()
+            .gap(7)
+            .items_center()
+            .child(icon("arrow-left", 11, t.muted))
+            .child(div().text_size(12).font_semibold().text_color(t.foreground).child(relayed[1]))
+            .child(div().text_size(11).text_color(t.dim).child(fmtTime(e.ts))),
+        )
+        .when(!!text, (el) => el.child(div().pl(18).text_size(13).line_height(1.55).text_color(t.foreground).child(text))),
+      { pt: row.turn === 1 ? 14 : 18, pb: 4 },
+    );
+  }
   return column(
     v_flex()
       .id(`prompt-${row.key}`)
@@ -520,9 +551,9 @@ export function promptRow(t, row, ctx) {
       .bg(alpha(t.accent, 0.075))
       .border(1)
       .border_color(alpha(t.accent, 0.22))
-      .on_mouse_down("right", (_e, cx) => ctx.copy(e.text, cx))
+      .on_mouse_down("right", (_e, cx) => ctx.copy(text, cx))
       .child(who(t, "user", "You", e.ts, badges.length ? h_flex().gap(6).children(badges) : null))
-      .when(!!e.text, (el) => el.child(div().pl(31).text_size(13.5).line_height(1.6).text_color(t.foreground).child(e.text)))
+      .when(!!text, (el) => el.child(div().pl(31).text_size(13.5).line_height(1.6).text_color(t.foreground).child(text)))
       .when(files.length > 0, (el) => el.child(div().pl(31).child(imageChips(t, `prompt-img-${row.key}`, files)))),
     { pt: row.turn === 1 ? 18 : 30, pb: 6 },
   );
