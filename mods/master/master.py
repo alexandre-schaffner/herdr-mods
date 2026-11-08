@@ -20,28 +20,18 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "shared"))
 import claude  # noqa: E402
+import masters  # noqa: E402
 from repos import repo_of  # noqa: E402
 
-MASTERS = claude.MASTERS
 PROMPT = os.path.join(HERE, "master.md")
-LABEL = "herdr.master"
+LABEL = masters.LABEL
 MODEL = "opus[1m]"
 SKILL = "/pstack:poteto-mode"
 FIRST = "You are this repository's master chat. Read your memory, then wait for my first request."
 # A new master starts in poteto mode and perpetual (see "Poteto mode" and "The tick" in master.md).
 START = "You are this repository's master chat. Read your memory, then start your perpetual tick: invoke the loop skill with 'master tick' (self-paced)."
-
-
-def load():
-    return claude.masters()
-
-
-def save(masters):
-    os.makedirs(os.path.dirname(MASTERS), exist_ok=True)
-    tmp = MASTERS + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(masters, f, indent=1)
-    os.replace(tmp, MASTERS)
+# A resumed master lost its loop with its process: it re-arms from its handoff.
+RESUMED = "You were restarted. Read your handoff (`hq handoff`), then restart your perpetual tick: invoke the loop skill with 'master tick' (self-paced)."
 
 
 def herdr(*args):
@@ -51,29 +41,20 @@ def herdr(*args):
     except ValueError:
         out = None
     if r.returncode != 0 or (isinstance(out, dict) and out.get("error")):
-        raise RuntimeError(f"herdr-app {' '.join(args[:2])}: " + ((out or {}).get("error") if isinstance(out, dict) else (r.stderr or r.stdout).strip()[-300:]))
+        why = out.get("error") if isinstance(out, dict) else (r.stderr or r.stdout).strip()[-300:]
+        raise RuntimeError(f"herdr-app {' '.join(args[:2])}: {why}")
     return out
 
 
-def cmd_plan(folder):
-    repo = repo_of(os.path.realpath(os.path.expanduser(folder)))
+def cmd_plan(folder, epic=None):
+    repo = masters.scope_of(repo_of(os.path.realpath(os.path.expanduser(folder))), epic)
     if not repo:
         return {"error": "no folder given"}
-    m = load().get(repo["key"]) or {}
-    sid = m.get("sessionId")
-    proc = claude.sessions().get(sid) if sid else None
-    alive = bool(proc and proc["alive"])
-    terminal, stale = None, []
-    for t in claude.terminals():
-        if t.get("state") != "live":
-            continue
-        labelled = (t.get("labels") or {}).get(LABEL) == repo["key"]
-        if claude.shows_session(t, proc) or (labelled and claude.runs_claude(t)):
-            terminal = claude.terminal_brief(t)
-        elif labelled:
-            stale.append(t)
-    return {"repo": repo, "sessionId": sid, "alive": alive, "pid": (proc or {}).get("pid"), "terminal": terminal,
-            "stale": [{"address": t["address"], "idle": not claude.has_children(t.get("pid"))} for t in stale]}
+    f = masters.find(repo, stale=True)
+    proc = f["proc"]
+    return {"repo": repo, "sessionId": f["entry"].get("sessionId"), "alive": bool(proc and proc["alive"]),
+            "pid": (proc or {}).get("pid"), "terminal": f["terminal"] and claude.terminal_brief(f["terminal"]),
+            "stale": f["stale"]}
 
 
 def retire(stale):
@@ -104,31 +85,40 @@ def home_space(repo, fallback):
 
 
 def start(repo, space, task):
-    masters = load()
-    m = masters.get(repo["key"]) or {}
+    m = masters.load().get(repo["key"]) or {}
     sid = m.get("sessionId")
     resume = bool(sid and claude.find_transcript(sid))
     if not resume:
         sid = str(uuid.uuid4())
-    argv = ["claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
+    # HQ_REPO pins the master's `hq` commands to its repository, wherever it `cd`s.
+    # HQ_REPO pins the master's `hq` commands to its repository, HQ_EPIC to its epic.
+    epic = repo.get("epic")
+    # A master started from inside another Claude session inherits CLAUDE_CODE_CHILD_SESSION, which turns
+    # transcript saving off; HQ reads the transcript, so force it on.
+    env = ["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1",
+           f"HQ_REPO={repo['path']}", *([f"HQ_EPIC={epic}"] if epic else [])]
+    argv = [*env, "claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
             *(["--resume", sid] if resume else ["--session-id", sid])]
-    first = task if resume else f"{SKILL} {task or START}"
-    space = home_space(repo, space)
+    who = (f"You are the master chat for the epic '{epic}' of this repository (HQ_EPIC={epic}): your managers, merge queue, "
+           f"roadmap, inbox and to-dos are this epic's alone, and its worktrees are the '{epic}' group in the sidebar. ") if epic else ""
+    first = f"{SKILL} {who}{RESUMED}{' ' + task if task else ''}" if resume else f"{SKILL} {who}{task or START}"
+    tab = f"Master · {epic}" if epic else "Master"
+    # An epic's master gets a space of its own; the main master starts where the repo is worked on.
+    space = space if epic else home_space(repo, space)
     args = ["--folder", repo["path"], "--argv", json.dumps(argv), *(["--task", first] if first else [])]
-    made = (herdr("do", "tab.new", "--space", space, "--name", "Master", *args) if space
-            else herdr("do", "space.new", "--name", repo["name"], "--tab", "Master", *args))
+    made = (herdr("do", "tab.new", "--space", space, "--name", tab, *args) if space
+            else herdr("do", "space.new", "--name", epic or repo["name"], "--tab", tab, *args))
     addr = made.get("terminal")
     if not addr:
         raise RuntimeError("herdr made no terminal: " + json.dumps(made))
-    masters[repo["key"]] = {"sessionId": sid, "path": repo["path"], "name": repo["name"], "startedAt": int(time.time() * 1000)}
-    save(masters)
-    subprocess.run(["hc", "label", addr, f"{LABEL}={repo['key']}"], capture_output=True, timeout=15)
+    masters.record(repo["key"], sessionId=sid, terminal=addr, path=repo["path"], name=repo["name"], startedAt=int(time.time() * 1000))
+    labelled = masters.set_label(addr, repo["key"])
     try:
         herdr("do", "tab.move", "--id", made.get("tab") or "", "--index", "0")
     except RuntimeError:
         pass  # cosmetic: the master works out of place
     pin(addr)
-    return {"address": addr, "sessionId": sid, "resumed": resume, "typed": first}
+    return {"address": addr, "sessionId": sid, "resumed": resume, "typed": first, "labelled": labelled}
 
 
 def pin(addr):
@@ -146,8 +136,14 @@ def pin(addr):
     return False
 
 
-def cmd_open(folder, space="", task=""):
-    plan = cmd_plan(folder)
+def cmd_open(folder, space="", task="", epic=None):
+    # One open at a time: a second click waits, then finds the master the first one started.
+    with masters.lock():
+        return _open(folder, space, task, epic)
+
+
+def _open(folder, space, task, epic=None):
+    plan = cmd_plan(folder, epic)
     if plan.get("error"):
         return plan
     t = plan["terminal"]
@@ -172,13 +168,18 @@ def cmd_open(folder, space="", task=""):
 
 def main(argv):
     cmd, a = (argv[1] if len(argv) > 1 else ""), argv[2:]
+    epic = None
+    if "--epic" in a:
+        i = a.index("--epic")
+        epic = a[i + 1] if i + 1 < len(a) else None
+        del a[i:i + 2]
     try:
         if cmd == "plan" and a:
-            out = cmd_plan(a[0])
+            out = cmd_plan(a[0], epic)
         elif cmd == "open" and a:
-            out = cmd_open(a[0], a[1] if len(a) > 1 else "", a[2] if len(a) > 2 else "")
+            out = cmd_open(a[0], a[1] if len(a) > 1 else "", a[2] if len(a) > 2 else "", epic)
         else:
-            out = {"error": "usage: master.py plan <folder> | open <folder> [space] [task]"}
+            out = {"error": "usage: master.py plan <folder> [--epic E] | open <folder> [space] [task] [--epic E]"}
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         out = {"error": str(e)}
     json.dump(out, sys.stdout, separators=(",", ":"))

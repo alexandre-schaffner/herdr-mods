@@ -7,10 +7,13 @@ The person (talk to the master):
                                    an outward-facing action that waits for a yes (HQ > Review)
   hq ask question --title T --body B   a decision only the person can make
   hq done --title T --body B [--link URL]...   finished work to look over after the fact
+  hq resolve ID "how it was settled"   close your own open ask once it's settled elsewhere or moot
+  Write bodies as Markdown (short paragraphs, options as a numbered list, the recommendation on
+  its own line); for more than two sentences use --body-file, since shell quotes lose line breaks.
 
 The org:
   hq managers                      the managers: id, kind, status, terminal, area
-  hq manager-new --id ID [--kind area|merge-queue] [--name N] [--area "<one sentence>"]
+  hq manager-new --id ID [--kind area|merge-queue] [--group <epic>] [--trunk <branch>] [--name N] [--area "<one sentence>"]
       [--base main] [--model opus] [--group G] [--charter "<text>" | --charter-file F]
       [--roster "<count x role (model, effort): notes>; ..."] [--launch]
                                    add a manager (and start it: worktree, space, Claude session)
@@ -27,10 +30,25 @@ Next moves (HQ > Next; the master keeps them, the person steers):
   hq todo start|done|drop ID       hq todo block ID <what it waits on>
   hq todo set ID [--title T] [--owner O] [--why W] [--status S]
 
+The artifact library (HQ > Library; what the person asked you to make):
+  hq artifact add <file|folder> --title T [--summary S] [--request "what they asked"] [--tags a,b] [--id slug]
+  hq artifact add --url <link> --title T ...   a published page (e.g. a claude.ai artifact)
+  hq artifact list | show ID | rm ID          adding again under the same id stores a new version
+
+The home update (HQ's homepage; the master writes it for the person):
+  hq home set <file>               publish it (Markdown; plain sentences, see 'Home' in the prompt)
+  hq home                          the current one
+
+Workflow owners (HQ > Workflows): each of the person's workflow runs gets its own owner session,
+which the master spawns and which reports back to it. `hq workflows` lists them;
+`hq workflow-launch <id>` spawns a requested one's owner; `hq workflow-close <id>` closes it once
+relayed; the owner files `hq workflow-report <id> ...`. `hq workflows help` has the rest.
+
 Keeping the picture current:
   hq status "<one line>"           the headline in HQ's status strip
   hq tick                          what changed since the last tick (decisions, steering, signals)
   hq lens | lens seed | lens set <file>   the live map (PR Lens graph) shown in HQ > Map
+  hq roadmap | roadmap seed | roadmap set <file>   each epic's plan in phases, shown in HQ > Roadmap
   hq handoff                       the master's handoff file (path)
   hq compact <terminal>            /compact an idle Claude session
   hq dream                         start a Dreaming pass over ~/agent-memory
@@ -42,6 +60,7 @@ standing orders, manager brief template, handoff, autopilot settings).
 from __future__ import annotations
 
 import calendar
+import fcntl
 import glob
 import hashlib
 import json
@@ -56,18 +75,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(APP, "shared"))
 import claude  # noqa: E402
+import masters as registry  # noqa: E402
 from repos import repo_of  # noqa: E402
+sys.path.insert(1, HERE)
+import workflow_owners as wfo  # noqa: E402
 
 HOME = os.path.expanduser("~")
 MEMORY = os.path.join(HOME, "agent-memory")
 DREAM_SH = os.path.join(HOME, ".local/share/agent-memory-dream/dream.sh")
 DREAM_LOG = os.path.join(HOME, ".local/state/agent-memory-dream/dream.log")
 MASTER_PROMPT = os.path.join(APP, "mods", "master", "master.md")
-GROUPS = os.path.join(APP, "data", "my-spaces", "groups.json")
 WORKTREES = os.path.join(HOME, ".herdr", "worktrees")
-MASTER_LABEL = "herdr.master"
+MASTER_LABEL = registry.LABEL
 MANAGER_LABEL = "herdr.hq.manager"
-LOOP_PROMPT = "/loop master tick"
+LOOP_PROMPT = registry.LOOP_PROMPT
+LOOP_GRACE_MS = 5 * 60_000  # past its wake time and idle this long, the master's loop has lapsed
+MASTER_PY = os.path.join(APP, "mods", "master", "master.py")
 POTETO = "/pstack:poteto-mode"  # every manager session starts in poteto mode
 TAIL = 3_000_000
 NOW = lambda: int(time.time() * 1000)  # noqa: E731
@@ -101,13 +124,15 @@ memory edits, pushing work branches, opening draft PRs, re-running CI, compactin
 DEFAULT_ORDERS = """# Standing orders
 
 Short, current instructions from the person. You re-read this file on every tick, so edits
-apply at once. Keep the org lean: one merge-queue manager, one manager per area of focus.
+apply at once. Keep the org lean: one merge-queue manager per epic that ships PRs (`--kind merge-queue
+--group <epic> --trunk <branch>`), one manager per area of focus.
 """
 
 DEFAULT_BASE = """You are a manager in {repo}'s org. The master chat ({master}) oversees you; the
 person reviews your work through Herdr's HQ panel (the `hq` skill explains it: run `hq` for the
 reference). Use `hq ask` / `hq done` to reach the person; changing the org or the master's next
-moves is the master's job.
+moves is the master's job. Bodies in Markdown via --body-file (paragraphs, numbered options,
+your recommendation on its own line); close what's settled with `hq resolve <id> "how"`.
 
 ## Poteto mode, always
 You run in poteto mode for the whole life of your session. Load the `pstack:poteto-mode` skill
@@ -204,7 +229,21 @@ def fail(msg):
 
 # ---- the repository and its folder of HQ state
 
-def repo_for(folder=None):
+def repo_for(folder=None, epic=None):
+    """The master scope a command acts in: the repo (see repo_base) and its epic: `--epic`, else
+    HQ_EPIC (set for an epic's master and its managers), else the epic of the folder's worktree
+    group when that epic has its own master. The main master's epic is the repo itself."""
+    r = repo_base(folder)
+    epic = epic or os.environ.get("HQ_EPIC") or None
+    if not epic:
+        cwd = folder[5:] if folder and folder.startswith("auto:") else (folder or os.environ.get("HQ_REPO") or os.getcwd())
+        g = registry.epic_of_folder(os.path.realpath(os.path.expanduser(cwd or HOME)))
+        if g and g in registry.epic_masters(r):
+            epic = g
+    return registry.scope_of(r, epic)
+
+
+def repo_base(folder=None):
     """`auto:<cwd>`: the repo of that folder when it has a master chat, else the repo of the
     most recently started master (HQ as a main view follows the space you're in)."""
     if folder and folder.startswith("auto:"):
@@ -214,13 +253,13 @@ def repo_for(folder=None):
         # The focused space's repo when its master runs, else the newest master that runs,
         # else the newest master at all.
         order = sorted(masters.values(), key=lambda m: m.get("startedAt") or 0, reverse=True)
-        cands = ([r] if r and r["key"] in masters else []) + [repo_of(m["path"]) for m in order if m.get("path")]
+        cands = ([r] if r and r["key"] in masters else []) + [repo_of(m["path"]) for k, m in sorted(masters.items(), key=lambda x: x[1].get("startedAt") or 0, reverse=True) if m.get("path") and "#" not in k]
         cands = [c for c in cands if c]
         for c in cands:
             if master_terminal(c)[0]:
                 return c
         return (cands or [r])[0] or fail("no repository here")
-    folder = os.path.realpath(os.path.expanduser(folder or os.getcwd()))
+    folder = os.path.realpath(os.path.expanduser(folder or os.environ.get("HQ_REPO") or os.getcwd()))
     r = repo_of(folder)
     if not r:
         fail("no repository here")
@@ -246,6 +285,7 @@ def paths(repo):
         "activity": os.path.join(d, "activity.jsonl"),
         "tick": os.path.join(d, "tick.json"),
         "managers": os.path.join(d, "managers"),
+        "owner": os.path.join(d, "workflow-owner.md"),
         "master": MASTER_PROMPT,
     }
 
@@ -257,8 +297,6 @@ def ensure(repo):
     for key, text in (("policy", DEFAULT_POLICY), ("orders", DEFAULT_ORDERS), ("base", DEFAULT_BASE)):
         if not os.path.exists(p[key]):
             write(p[key], text)
-    if not os.path.exists(p["handoff"]):
-        write(p["handoff"], "# Master handoff\n\n(The master keeps this current at the end of every tick.)\n")
     return p
 
 
@@ -280,7 +318,48 @@ def org(repo):
 
 
 def save_org(repo, o):
-    write_json(paths(repo)["org"], o)
+    with org_lock(repo):
+        write_json(paths(repo)["org"], o)
+
+
+_org_held = set()
+
+
+class org_lock:
+    """Serialises org.json writers (HQ's 12 s snapshot, launches that take minutes, the
+    master's `hq manager-*`). Re-entrant within a process."""
+
+    def __init__(self, repo):
+        self.path = paths(repo)["org"] + ".lock"
+
+    def __enter__(self):
+        if self.path in _org_held:
+            self.f = None
+            return self
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.f = open(self.path, "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        _org_held.add(self.path)
+        return self
+
+    def __exit__(self, *exc):
+        if self.f:
+            _org_held.discard(self.path)
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+            self.f.close()
+
+
+def patch_manager(repo, mid, fields):
+    """Writes `fields` into one manager's entry, re-reading org.json under the lock, so a
+    slow writer (a launch) never puts back what someone else changed meanwhile."""
+    with org_lock(repo):
+        o = org(repo)
+        m = next((x for x in o["managers"] if x["id"] == mid), None)
+        if m is None:
+            return None
+        m.update(fields)
+        write_json(paths(repo)["org"], o)
+        return m
 
 
 def log_activity(repo, kind, text, **extra):
@@ -327,27 +406,45 @@ def status_of(t):
     return st
 
 
+_masters = {}
+
+
 def master_terminal(repo):
-    """The master's terminal: labelled for the repo and still running Claude Code."""
-    m = claude.masters().get(repo["key"]) or {}
-    # No live session process for this repo's master: nothing to look for (fast path).
-    sess = claude.sessions().get(m.get("sessionId")) if m.get("sessionId") else None
-    if not sess or not sess.get("alive"):
-        return None, m
-    cache = os.path.join(data_dir(repo), "master-terminal")
-    is_master = lambda got: bool(got) and (got.get("labels") or {}).get(MASTER_LABEL) == repo["key"] and status_of(got)
-    live = {t["address"] for t in hc_ls() if t.get("agent") == "claude-code"}
-    cached = (read(cache, "") or "").strip()
-    if cached in live:
-        got = hc_get(cached)
-        if is_master(got):
-            return got, m
-    for addr in live:
-        got = hc_get(addr)
-        if is_master(got):
-            write(cache, addr)
-            return got, m
-    return None, m
+    """(The master's terminal as `hc get` has it, or None; its registry entry), by the rule
+    master.py uses too (shared/masters.py). Looked up once per command."""
+    if repo["key"] not in _masters:
+        f = registry.find(repo)
+        _masters[repo["key"]] = (f["terminal"], f["entry"])
+    return _masters[repo["key"]]
+
+
+def master_record(repo, facts=False, **opts):
+    """The master as HQ reports it: terminal, status, session, and its transcript facts."""
+    mt, entry = master_terminal(repo)
+    sid = entry.get("sessionId")
+    rec = {"terminal": (mt or {}).get("address"), "status": status_of(mt), "sessionId": sid,
+           "where": ((mt or {}).get("labels") or {}).get("where"), "turn": (mt or {}).get("turn"), "facts": {}}
+    if facts and sid:
+        rec["facts"] = session_facts(sid, repo["path"], **opts)
+    rec["loop"] = loop_state(rec["facts"].get("loop"), rec["status"]) if rec["terminal"] else {"state": "gone"}
+    return rec
+
+
+def loop_state(loop, status, now=None):
+    """The master's loop, decided once for the signals, autopilot and the UI:
+    unarmed | stopped | running (mid-tick) | waiting (until wakeAt) | overdue (lapsed)."""
+    now = now or NOW()
+    if not loop:
+        return {"state": "unarmed"}
+    if loop.get("stopped"):
+        return {"state": "stopped", "reason": loop.get("reason")}
+    wake = loop.get("wakeAt")
+    base = {"wakeAt": wake, "reason": loop.get("reason")}
+    if status in ("working", "blocked") or not wake:
+        return {"state": "running", **base}
+    if now > wake + LOOP_GRACE_MS:
+        return {"state": "overdue", "overdueMin": int((now - wake) / 60000), **base}
+    return {"state": "waiting", **base}
 
 
 def session_of_terminal(t):
@@ -469,7 +566,7 @@ def session_facts(session_id, cwd=None, comms=False, tail=TAIL, keep=40):
                 if text and "<hc from=" not in text and not text.startswith("<") and e.get("userType") == "external" and not e.get("isMeta"):
                     if not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in (c if isinstance(c, list) else [])):
                         facts["comms"].append({"dir": "in", "peer": "person", "at": ts(e), "text": clip(text, 400)})
-            if isinstance(msg.get("content"), str) and msg["content"].startswith("/loop"):
+            if isinstance(msg.get("content"), str) and (msg["content"].startswith("/loop") or "<command-name>/loop</command-name>" in msg["content"]):
                 facts["loop"] = facts["loop"] or {"stopped": False, "at": ts(e), "wakeAt": None, "reason": "loop started"}
     if pending:
         facts["doing"] = list(pending.values())[-1]
@@ -550,6 +647,7 @@ def who_am_i(repo):
         for m in org(repo)["managers"]:
             if m.get("terminal") == addr:
                 role = m["id"]
+        role = role or wfo.role_of(sys.modules[__name__], repo, addr)
     return {"terminal": addr, "role": role}
 
 
@@ -582,7 +680,8 @@ def cmd_ask(repo, kind, args):
     print(f"{it['id']}  (filed for the person; {'wait for the HQ DECISION message' if kind != 'done' else 'no reply needed'})")
 
 
-VERDICTS = {"approve": "APPROVED", "reject": "REJECTED", "answer": "ANSWERED", "ack": "ACKNOWLEDGED", "reopen": "REOPENED"}
+VERDICTS = {"approve": "APPROVED", "reject": "REJECTED", "answer": "ANSWERED", "ack": "ACKNOWLEDGED", "reopen": "REOPENED",
+            "dismiss": "DISMISSED", "resolved": "RESOLVED"}
 
 
 def cmd_decide(repo, item_id, verdict, note=""):
@@ -592,7 +691,7 @@ def cmd_decide(repo, item_id, verdict, note=""):
     it = claude.read_json(path)
     if not isinstance(it, dict):
         fail(f"no inbox item {item_id}")
-    silent = verdict == "ack" and not note.strip()
+    silent = verdict in ("ack", "dismiss") and not note.strip()
     it["state"] = "decided"
     it["decision"] = {"verdict": verdict, "note": note, "at": NOW(), "delivered": silent, "silent": silent}
     write_json(path, it)
@@ -600,6 +699,43 @@ def cmd_decide(repo, item_id, verdict, note=""):
     if not silent:
         deliver_one(repo, it, path)
     out({"ok": True, "item": claude.read_json(path)})
+
+
+def cmd_resolve(repo, item_id, note):
+    """The asker closes its own open item: settled elsewhere (in chat, by another agent) or moot.
+    Nothing is sent; HQ shows it as resolved with the note."""
+    path = os.path.join(paths(repo)["inbox"], item_id + ".json")
+    it = claude.read_json(path)
+    if not isinstance(it, dict):
+        fail(f"no inbox item {item_id}")
+    if it.get("state") != "open":
+        print(f"{item_id} is already closed ({(it.get('decision') or {}).get('verdict')})")
+        return
+    who = who_am_i(repo)
+    it["state"] = "decided"
+    it["decision"] = {"verdict": "resolved", "note": note, "at": NOW(), "delivered": True, "silent": True,
+                      "by": who.get("role") or who.get("terminal")}
+    write_json(path, it)
+    log_activity(repo, "decision", f"Resolved by {it['decision']['by'] or 'the asker'}: {it['title']}" + (f" ({clip(note, 80)})" if note else ""), id=item_id)
+    print(f"{item_id} resolved: it leaves the person's inbox")
+
+
+def cmd_reopen(repo, item_id):
+    """Puts a closed item back in the person's inbox (a mistaken dismiss, or it matters again)."""
+    path = os.path.join(paths(repo)["inbox"], item_id + ".json")
+    it = claude.read_json(path)
+    if not isinstance(it, dict):
+        fail(f"no inbox item {item_id}")
+    prev = it.get("decision")
+    it["state"] = "open"
+    it["decision"] = None
+    it.setdefault("history", []).append({"reopenedAt": NOW(), "was": prev})
+    write_json(path, it)
+    log_activity(repo, "decision", f"Reopened: {it['title']}", id=item_id, by="person")
+    mt, _ = master_terminal(repo)
+    if mt and (prev or {}).get("verdict") in ("dismiss", "resolved"):
+        run(["hc", "send", mt["address"], f"HQ: the person reopened {item_id} ('{it['title']}'), which had been {'dismissed' if prev['verdict'] == 'dismiss' else 'resolved'}. It's open again in their inbox; treat it as unanswered and wait for their decision."], timeout=25)
+    out({"ok": True})
 
 
 def decision_text(it):
@@ -613,30 +749,49 @@ def decision_text(it):
     return head
 
 
+DELIVERY_TRIES = 20  # about 20 minutes of autopilot retries, then it waits for the person
+
+
+def asker_terminal(repo, it):
+    """Where the asker is now: the master and managers move to new terminals when they are
+    restarted or respawned, so the address saved at filing time is only the last resort."""
+    frm = it.get("from") or {}
+    role = frm.get("role")
+    if role == "master":
+        return (master_terminal(repo)[0] or {}).get("address")
+    if role:
+        m = next((x for x in org(repo)["managers"] if x["id"] == role), None)
+        if m is not None:
+            return m.get("terminal") if m.get("status") != "retired" else None
+    return frm.get("terminal")
+
+
 def deliver_one(repo, it, path):
-    """Sends a decision to whoever asked (and a one-line copy to the master when that was a
-    manager). A terminal showing a question dialog refuses messages: retried later."""
-    mt, _ = master_terminal(repo)
-    master_addr = (mt or {}).get("address")
-    asker = (it.get("from") or {}).get("terminal")
-    targets = [a for a in [asker or master_addr] if a]
-    if asker and master_addr and asker != master_addr:
-        targets.append(master_addr)
-    if not targets:
-        it["decision"]["error"] = "no master terminal to tell"
+    """Sends a decision to whoever asked, plus a one-line copy to the master when a manager
+    asked. A terminal showing a question dialog refuses messages: retried later. When the
+    asker is gone, the master gets it instead (it can pass it on)."""
+    d = it["decision"]
+    if NOW() - (d.get("sending") or 0) < 60_000:
+        return  # another copy of HQ is sending it right now
+    d["sending"] = NOW()
+    write_json(path, it)
+    master_addr = (master_terminal(repo)[0] or {}).get("address")
+    asker = asker_terminal(repo, it)
+    text = decision_text(it)
+    primary = asker or master_addr
+    if not primary:
+        d.update(error="neither the asker nor the master is running", sending=None, tries=d.get("tries", 0) + 1)
         write_json(path, it)
         return
-    text = decision_text(it)
-    errors = []
-    for i, addr in enumerate(targets):
-        msg = text if i == 0 else f"FYI {text} (sent to {asker})"
-        code, so, se = run(["hc", "send", addr, msg], timeout=25)
-        if code != 0:
-            errors.append(f"{addr}: {(se or so).strip()[-160:]}")
-    it["decision"]["delivered"] = not errors or len(errors) < len(targets) and asker not in [e.split(":")[0] for e in errors]
-    it["decision"]["error"] = "; ".join(errors) or None
-    if it["decision"]["delivered"]:
-        it["decision"]["deliveredAt"] = NOW()
+    code, so, se = run(["hc", "send", primary, text if asker else f"{text} (its asker is gone: pass it on)"], timeout=25)
+    ok = code == 0
+    if ok and asker and master_addr and asker != master_addr and not d.get("copied"):
+        c, _, _ = run(["hc", "send", master_addr, f"FYI {text} (sent to {asker})"], timeout=25)
+        d["copied"] = c == 0
+    d.update(delivered=ok, sending=None, tries=d.get("tries", 0) + 1,
+             error=None if ok else f"{primary}: {(se or so).strip()[-160:]}")
+    if ok:
+        d["deliveredAt"] = NOW()
     write_json(path, it)
 
 
@@ -644,7 +799,7 @@ def cmd_deliver(repo):
     n = 0
     for it in inbox_items(repo, include_closed=True):
         d = it.get("decision") or {}
-        if it.get("state") == "decided" and not d.get("delivered"):
+        if it.get("state") == "decided" and not d.get("delivered") and d.get("tries", 0) < DELIVERY_TRIES:
             deliver_one(repo, it, os.path.join(paths(repo)["inbox"], it["id"] + ".json"))
             n += 1
     return n
@@ -674,15 +829,22 @@ def find_manager(repo, mid):
 
 def cmd_manager_save(repo, file):
     """Adds or updates a manager from a JSON file: {id, kind, name, area, base, model, roster,
-    charter (text, saved to its charter.md), group}. One merge-queue manager at most."""
+    charter (text, saved to its charter.md), group, trunk}. One merge-queue manager per epic (group)."""
     ensure(repo)
     m = claude.read_json(file)
     if not isinstance(m, dict) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", m.get("id") or ""):
         fail("a manager needs an id: lowercase letters, digits and dashes")
     o = org(repo)
     kind = m.get("kind") or "area"
-    if kind == "merge-queue" and any(x["kind"] == "merge-queue" and x["id"] != m["id"] and x.get("status") != "retired" for x in o["managers"]):
-        fail("there is already a merge-queue manager; retire it first")
+    if kind == "merge-queue":
+        cur0 = next((x for x in o["managers"] if x["id"] == m["id"]), {})
+        group = m.get("group") or cur0.get("group")
+        if not group:
+            fail("a merge queue serves one epic: pass --group <epic> (a worktree group's name)")
+        other = next((x for x in o["managers"] if x["kind"] == "merge-queue" and x["id"] != m["id"]
+                      and x.get("status") != "retired" and x.get("group") == group), None)
+        if other:
+            fail(f"the epic '{group}' already has a merge queue ({other['id']}); retire it first")
     if kind == "area" and m.get("area") and any(x["kind"] == "area" and x["id"] != m["id"] and x.get("status") != "retired"
                                                and (x.get("area") or "").strip().lower() == m["area"].strip().lower() for x in o["managers"]):
         fail(f"another manager already owns the area '{m['area']}'")
@@ -721,7 +883,7 @@ def parse_roster(text):
     return rows
 
 
-MANAGER_FLAGS = ("id", "kind", "name", "area", "base", "model", "group", "charter", "charter-file", "roster")
+MANAGER_FLAGS = ("id", "kind", "name", "area", "base", "model", "group", "trunk", "charter", "charter-file", "roster")
 
 
 def manager_flags(args):
@@ -751,7 +913,7 @@ def cmd_manager_new(repo, args):
     if any(m["id"] == o["id"] for m in org(repo)["managers"]):
         fail(f"there is already a manager {o['id']}; change it with `hq manager-set {o['id']} ...`")
     o.setdefault("kind", "area")
-    o.setdefault("name", o["id"].replace("-", " ").title() if o["kind"] == "area" else "Merge queue")
+    o.setdefault("name", o["id"].replace("-", " ").title() if o["kind"] == "area" else f"Merge queue · {o.get('group') or '?'}")
     tmp = os.path.join(paths(repo)["dir"], f"new-{o['id']}.json")
     write_json(tmp, o)
     try:
@@ -820,13 +982,44 @@ def compose_brief(repo, m):
                            label=MANAGER_LABEL, policy=p["policy"])
     except (KeyError, IndexError, ValueError):
         pass
-    kind = "the merge queue" if m.get("kind") == "merge-queue" else f"the area: {(m.get('area') or m.get('name') or '').rstrip('.')}"
+    kind = (f"the merge queue for the epic {m['group']}" if m.get("group") else "the merge queue") if m.get("kind") == "merge-queue" \
+        else f"the area: {(m.get('area') or m.get('name') or '').rstrip('.')}"
     roster = m.get("roster") or []
     team = "\n".join(f"- {r.get('count', 1)} × {r.get('role')} ({r.get('model')}{', ' + r['effort'] if r.get('effort') else ''})"
                      + (f": {r['notes']}" if r.get("notes") else "") for r in roster) or "- (no fixed team: size it per task)"
     charter = read(charter_path(repo, m["id"]), "").strip() or "(No charter yet: ask the master what to work on.)"
+    queue = queue_brief(repo, m) if m.get("kind") == "merge-queue" else ""
     return (f"# Manager brief: {m.get('name') or m['id']}\n\nYou are `{m['id']}`, the manager of {kind}.\n\n"
-            f"## Charter\n{charter}\n\n## Your team\n{team}\n\n{base.strip()}\n")
+            f"## Charter\n{charter}\n\n{queue}## Your team\n{team}\n\n{base.strip()}\n")
+
+
+def queue_brief(repo, m):
+    """What a per-epic merge queue needs to know: its epic, trunk, the worktrees it serves, and the
+    engine to start from (another queue's tick.py/scan.py), without touching other epics' queues."""
+    group = m.get("group")
+    wts = sorted(repo_groups(repo).get(group, [])) if group else []
+    base = os.path.basename(repo["path"].rstrip("/"))
+    root = os.path.join(HOME, ".herdr", "worktrees", base)
+    others = [x for x in org(repo)["managers"] if x["kind"] == "merge-queue" and x["id"] != m["id"] and x.get("status") != "retired"]
+    ref = None
+    for x in others:
+        hit = glob.glob(os.path.join(x.get("worktree") or "", ".audit", "*", "queue", "tick.py"))
+        if hit:
+            ref = (x, os.path.dirname(hit[0]))
+            break
+    slug = re.sub(r"[^a-z0-9]+", "-", (group or m["id"]).lower()).strip("-")
+    lines = [f"## Your queue", "",
+             f"- Epic: **{group or '(none: ask the master which epic you serve)'}**. You batch only this epic's PRs.",
+             f"- Trunk: `{m['trunk']}`." if m.get("trunk") else "- Trunk: find the branch this epic's PRs target (their base), confirm it with the master, then record it: `hq manager-set " + m["id"] + " --trunk <branch>`.",
+             f"- Worktrees you serve ({len(wts)}): " + (", ".join(wts[:30]) + (" …" if len(wts) > 30 else "") if wts else "none grouped yet") +
+             f". Read READY lines only from `{root}/<these>/.audit/*/report.md`; the sidebar's groups are in `{GROUPS_FILE}`, re-read it each scan (worktrees join and leave).",
+             f"- Batch branches: one prefix per epic so two queues never collide (new queues: `queue/{slug}/batch-<n>`; a queue already running keeps its names). Keep your state, lock and report in your own worktree. Never touch another epic's queue, state or batch branches."]
+    if ref:
+        lines.append(f"- Start from the `{ref[0]['id']}` queue's engine in `{ref[1]}` (tick.py, scan.py and its report's 'Local merge queue' and 'Handoff' sections for the rules). Copy it into your worktree, then make its paths, trunk, worktree scope and branch prefix yours. Don't edit theirs.")
+    else:
+        lines.append("- No other queue runs yet: build the engine the way the master describes, one batch in flight at a time, CI once per batch, merge only with the person's approval.")
+    lines.append("- Same contract as every queue: QUEUED-GREEN / QUEUE-REJECTED / QUEUE-REVOKED lines in your report, approvals through `hq ask`, the master merges.")
+    return "\n".join(lines) + "\n\n"
 
 
 def cmd_brief(repo, mid):
@@ -843,21 +1036,16 @@ def space_for_folder(folder):
     return None
 
 
-def file_group(folder, group):
-    if not group:
-        return
-    g = claude.read_json(GROUPS)
-    g = g if isinstance(g, dict) else {}
-    if g.get(folder) != group:
-        g[folder] = group
-        write_json(GROUPS, g)
-
-
 def start_manager_tab(repo, m, folder, first):
     """A new tab running the manager's Claude session in its worktree's space."""
     argv = ["claude", "--permission-mode", "auto", "--name", f"{m['id']} · manager"]
     if m.get("model"):
         argv[1:1] = ["--model", m["model"]]
+    # Keep its transcript on disk (HQ reads it) even when launched from inside another Claude session.
+    env = ["env", "-u", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1"]
+    if repo.get("epic"):  # its `hq` commands act in its epic, wherever it runs
+        env += [f"HQ_REPO={repo['path']}", f"HQ_EPIC={repo['epic']}"]
+    argv = [*env, *argv]
     space = space_for_folder(folder)
     args = ["--folder", folder, "--argv", json.dumps(argv), "--task", first]
     made = (herdr("do", "tab.new", "--space", space, "--name", m["id"], *args) if space
@@ -865,7 +1053,9 @@ def start_manager_tab(repo, m, folder, first):
     addr = made.get("terminal")
     if not addr:
         raise RuntimeError("herdr made no terminal")
-    run(["hc", "label", addr, f"{MANAGER_LABEL}={m['id']}"])
+    code, _, se = run(["hc", "label", addr, f"{MANAGER_LABEL}={m['id']}"])
+    if code != 0:
+        sys.stderr.write(f"hc label {addr}: {se.strip()[-200:]}\n")  # the org still records the terminal
     return addr, made.get("tab")
 
 
@@ -886,10 +1076,8 @@ def cmd_manager_launch(repo, mid, base_override=None):
         addr, tab = start_manager_tab(repo, m, folder, first)
     except RuntimeError as e:
         fail(str(e))
-    file_group(folder, m.get("group"))
-    m.update({"worktree": folder, "terminal": addr, "tab": tab, "status": "active", "report": os.path.join(audit, "report.md"),
-              "launchedAt": NOW()})
-    save_org(repo, o)
+    patch_manager(repo, mid, {"worktree": folder, "terminal": addr, "tab": tab, "status": "active",
+                              "report": os.path.join(audit, "report.md"), "launchedAt": NOW()})
     log_activity(repo, "org", f"Launched manager {mid} in {addr}", by="person")
     out({"ok": True, "terminal": addr})
 
@@ -921,8 +1109,7 @@ def cmd_manager_respawn(repo, mid):
             herdr("do", "tab.close", "--id", old_tab, "--confirmed", "true")
         except RuntimeError:
             pass
-    m.update({"terminal": addr, "tab": tab, "status": "active", "respawnedAt": NOW(), "report": report})
-    save_org(repo, o)
+    patch_manager(repo, mid, {"terminal": addr, "tab": tab, "status": "active", "respawnedAt": NOW(), "report": report})
     log_activity(repo, "org", f"Respawned manager {mid}: {addr} replaces {old and old.get('address')}", by="person")
     out({"ok": True, "terminal": addr})
 
@@ -931,7 +1118,7 @@ def cmd_discover(repo):
     """Claude sessions in this repo's worktrees that look like managers (a .audit/<x>/report.md
     with a Handoff) and aren't in the org yet."""
     o = org(repo)
-    known = {m.get("terminal") for m in o["managers"]}
+    known = {m.get("terminal") for m in o["managers"]} | wfo.terminals(sys.modules[__name__], repo)
     mt, _ = master_terminal(repo)
     found = []
     for t in hc_ls():
@@ -939,7 +1126,7 @@ def cmd_discover(repo):
             continue
         cwd = t.get("cwd") or ""
         r = repo_of(cwd) if cwd else None
-        if not r or r["key"] != repo["key"]:
+        if not r or r["key"] != repo.get("repoKey", repo["key"]):
             continue
         reports = sorted(glob.glob(os.path.join(cwd, ".audit", "*", "report.md")), key=os.path.getmtime, reverse=True)
         h = handoff_of(reports[0]) if reports else {"text": "", "goal": None}
@@ -991,18 +1178,17 @@ def cmd_adopt(repo, addr, mid, kind):
     o = org(repo)
     if any(m["id"] == mid for m in o["managers"]):
         fail(f"there is already a manager {mid}")
-    if kind == "merge-queue" and any(m["kind"] == "merge-queue" and m.get("status") != "retired" for m in o["managers"]):
-        fail("there is already a merge-queue manager")
+    if kind == "merge-queue" and any(m["kind"] == "merge-queue" and m.get("status") != "retired" and not m.get("group") for m in o["managers"]):
+        fail("there is already a merge-queue manager with no epic; give it one (`hq manager-set <id> --group <epic>`) first")
     t = hc_get(addr)
     if not t:
         fail(f"no terminal {addr}")
     cwd = t.get("cwd")
     reports = sorted(glob.glob(os.path.join(cwd, ".audit", "*", "report.md")), key=os.path.getmtime, reverse=True)
     h = handoff_of(reports[0]) if reports else {}
-    groups = claude.read_json(GROUPS) or {}
     m = {"id": mid, "kind": kind, "name": mid.replace("-", " ").title() if kind == "area" else "Merge queue",
          "area": first_sentence(h.get("goalFull")), "worktree": cwd, "terminal": addr, "report": reports[0] if reports else None,
-         "status": "active", "roster": DEFAULT_ROSTER, "group": groups.get(cwd), "createdAt": NOW(), "adopted": True}
+         "status": "active", "roster": DEFAULT_ROSTER, "createdAt": NOW(), "adopted": True}
     o["managers"].append(m)
     save_org(repo, o)
     if reports and not os.path.exists(charter_path(repo, mid)):
@@ -1057,16 +1243,18 @@ def signals_for(repo, master, managers, items, s):
     def add(level, who, text, terminal=None, action=None):
         sig.append({"level": level, "who": who, "text": text, "terminal": terminal, "action": action})
 
-    if not master.get("terminal"):
+    if master is None:
+        pass  # the master's own tick: it knows how it is
+    elif not master.get("terminal"):
         add("alert", "master", "The master chat isn't running.", action="open-master")
     else:
-        loop = (master.get("facts") or {}).get("loop")
+        loop = master["loop"]
         st = master.get("status")
-        if not loop or loop.get("stopped"):
+        if loop["state"] in ("unarmed", "stopped"):
             add("warn", "master", "The master's loop isn't armed: it only acts when spoken to.", master["terminal"], "loop-arm")
-        elif loop.get("wakeAt") and now > loop["wakeAt"] + 5 * 60_000 and st in ("idle", "done"):
-            add("warn", "master", f"The master's tick is {int((now - loop['wakeAt']) / 60000)} min overdue.", master["terminal"], "loop-arm")
-        ctx = (master.get("facts") or {}).get("context") or 0
+        elif loop["state"] == "overdue":
+            add("warn", "master", f"The master's tick is {loop['overdueMin']} min overdue.", master["terminal"], "loop-arm")
+        ctx = master["facts"].get("context") or 0
         if ctx > s["masterCompactAt"]:
             add("warn", "master", f"Master context at {ctx // 1000}k tokens.", master["terminal"], "compact")
         if st == "blocked":
@@ -1112,16 +1300,15 @@ def signals_for(repo, master, managers, items, s):
 def cmd_snapshot(repo):
     p = ensure(repo)
     s = settings(repo)
-    mt, minfo = master_terminal(repo)
-    msess = session_of_terminal(mt) if mt else None
-    msid = (msess or {}).get("sessionId") or minfo.get("sessionId")
-    master = {"terminal": (mt or {}).get("address"), "status": status_of(mt), "sessionId": msid,
-              "where": ((mt or {}).get("labels") or {}).get("where"), "turn": (mt or {}).get("turn"),
-              "facts": session_facts(msid, repo["path"], comms=True) if msid else {},
-              "team": subagents_of(msid, repo["path"]) if msid else []}
+    master = master_record(repo, facts=True, comms=True)
+    master["team"] = subagents_of(master["sessionId"], repo["path"]) if master["sessionId"] else []
+    mt = master_terminal(repo)[0]
     o = org(repo)
+    known = {m["id"]: m.get("sessionId") for m in o["managers"]}
     managers = [manager_view(repo, m, s) for m in o["managers"]]
-    save_org(repo, o)  # learned session ids
+    for m in managers:  # learned session ids, written alone so a concurrent org change survives
+        if m.get("sessionId") and m["sessionId"] != known.get(m["id"]):
+            patch_manager(repo, m["id"], {"sessionId": m["sessionId"]})
     managers.sort(key=lambda m: (m.get("status") == "retired", m["kind"] != "merge-queue", m["id"]))
     items = inbox_items(repo, include_closed=True)
     open_items = [i for i in items if i.get("state") == "open"]
@@ -1143,8 +1330,17 @@ def cmd_snapshot(repo):
     doc = claude.read_json(os.path.join(lens_dir(repo), "org.json")) if lens.get("at") else None
     lens["doc"] = doc or lens_seed_body(repo, managers, mt)
     lens["auto"] = not doc
-    out({"repo": repo, "now": NOW(), "paths": p, "settings": s, "master": master, "managers": managers, "lens": lens, "todo": todo,
-         "status": st, "counts": counts, "signals": signals_for(repo, master, managers, items, s),
+    wf = wfo.snapshot(sys.modules[__name__], repo)
+    out({"workflows": wf,
+         "repo": repo, "now": NOW(), "paths": p, "settings": s, "master": master, "managers": managers, "lens": lens, "todo": todo,
+         "home": home_meta(repo),
+         "roadmap": roadmap_snapshot(repo),
+         "epic": my_epic(repo), "epics": epics_snapshot(repo),
+         "merges": merges_snapshot(repo),
+         "queues": queues_snapshot(repo, managers),
+         "artifacts": art_list(repo),
+         "status": st, "counts": counts,
+         "signals": sorted(signals_for(repo, master, managers, items, s) + wf["signals"], key=lambda x: ("alert", "warn", "info").index(x["level"])),
          "inbox": items[:200], "activity": activity(repo)})
 
 
@@ -1173,16 +1369,21 @@ def cmd_tick(repo):
         d = it.get("decision") or {}
         if d.get("at", 0) > since and not d.get("silent"):
             lines.append(f"- Decision: {decision_text(it)}")
+        elif d.get("at", 0) > since and d.get("verdict") == "dismiss" and it["kind"] in ("approval", "question"):
+            asked = (it.get("from") or {}).get("role") or "?"
+            lines.append(f"- Dismissed without a reply (from {asked}): [{it['id']}] {it['title']}. Don't act on it; ask again only if it still matters.")
         if it.get("createdAt", 0) > since and (it.get("from") or {}).get("role") != "master":
             lines.append(f"- Filed by {(it.get('from') or {}).get('role') or (it.get('from') or {}).get('terminal')}: [{it['kind']}] {it['title']}")
     waiting = [i for i in items if i.get("state") == "open" and i["kind"] in ("approval", "question")]
+    stale = [i for i in waiting if NOW() - (i.get("createdAt") or 0) > 30 * 60_000]
+    if stale:
+        lines.append("- Still open in the person's inbox: " + "; ".join(f"[{i['id']}] {clip(i['title'], 50)}" for i in stale[:4])
+                     + ". If one is settled or moot, close it: `hq resolve <id> \"how it was settled\"`.")
     if waiting:
         lines.append(f"- Waiting on the person: {len(waiting)} ({', '.join(clip(i['title'], 50) for i in waiting[:4])})")
     o = org(repo)
-    mt, minfo = master_terminal(repo)
-    master = {"terminal": (mt or {}).get("address"), "status": status_of(mt), "facts": {}}
     managers = [manager_view(repo, m, s) for m in o["managers"]]
-    for sg in signals_for(repo, master, managers, [], s):
+    for sg in signals_for(repo, None, managers, [], s):
         if sg["who"] in ("master", "hq", "you"):
             continue
         lines.append(f"- {sg['level'].upper()} {sg['who']}{' (' + sg['terminal'] + ')' if sg.get('terminal') else ''}: {sg['text']}")
@@ -1191,14 +1392,16 @@ def cmd_tick(repo):
             continue
         f = m.get("facts") or {}
         lines.append(f"- {m['id']} {m['terminal']} {m['status']}: {clip(f.get('doing') or f.get('said') or '', 110)}")
-    code, so, _ = run(["git", "-C", MEMORY, "log", "--format=%s", "-200"])
-    if code == 0:
-        subjects = so.splitlines()
-        n = next((i for i, x in enumerate(subjects) if x.startswith("Dream")), len(subjects))
-        if n >= s["dreamEvery"] and not dream_running():
-            lines.append(f"- Memory: {n} commits since the last Dream. Run `hq dream` when you're not mid-edit.")
+    n = commits_since_dream()
+    if n is not None and n >= s["dreamEvery"] and not dream_running():
+        lines.append(f"- Memory: {n} commits since the last Dream. Run `hq dream` when you're not mid-edit.")
     if dream_running():
         lines.append("- A Dream is running: hold memory edits until it finishes.")
+    hm = home_meta(repo)
+    if not hm.get("text"):
+        lines.append("- Home update: none yet. Write it this tick (see 'Home' in your prompt): `hq home set <file>`.")
+    elif NOW() - (hm.get("at") or 0) > 30 * 60_000:
+        lines.append(f"- Home update: written {int((NOW() - hm['at']) / 60000)} min ago. Rewrite it if anything moved (`hq home set <file>`).")
     td = todo_load(repo)
     steer = [(it, n) for it in td["items"] for n in it.get("notes", []) if not n.get("seen") and n.get("at", 0) > since]
     for it, n in steer:
@@ -1213,9 +1416,41 @@ def cmd_tick(repo):
         lines.append("- Live map: not published yet. `hq lens` explains it; publish one this tick.")
     elif NOW() - lm["at"] > 45 * 60_000:
         lines.append(f"- Live map: last published {int((NOW() - lm['at']) / 60000)} min ago. Update it if the picture changed (`hq lens`).")
-    prev["at"] = now
-    write_json(p["tick"], prev)
+    rm = roadmap_load(repo)
+    planned = {e.get("group") for e in roadmap_merged(repo).get("epics", [])}
+    others = {e for e in registry.epic_masters(repo) if e and e != my_epic(repo)}
+    # Plan your own epic; the main master also covers epics no master runs.
+    mine = {my_epic(repo)} if repo.get("epic") else set(repo_groups(repo)) - others
+    missing = sorted(g for g in mine - planned if g)
+    if missing:
+        lines.append(f"- Roadmap: no plan yet for {', '.join(missing[:4])}{'…' if len(missing) > 4 else ''}. `hq roadmap` explains it.")
+    elif rm.get("at") and NOW() - rm["at"] > 3 * 3600_000:
+        lines.append(f"- Roadmap: last published {int((NOW() - rm['at']) / 3600000)} h ago. Update phases that moved (`hq roadmap`).")
+    lines.extend(wfo.tick_lines(sys.modules[__name__], repo, since))
+    # Only the master's tick consumes what's new: a manager or the person running `hq tick`
+    # would otherwise take decisions and to-do notes the master never sees.
+    me = who_am_i(repo)
+    if me["role"] == "master" or not me["terminal"]:
+        prev["at"] = now
+        write_json(p["tick"], prev)
+    else:
+        lines.append(f"(Read from {me['role'] or me['terminal']}, not the master: the master's tick cursor was left alone.)")
     print("\n".join(lines))
+
+
+def commits_since_dream():
+    """Memory commits since the last Dream ran, committed or not (dream.sh records every
+    run in last-run); falls back to the last commit whose subject starts with "Dream"."""
+    last = (read(os.path.join(os.path.dirname(DREAM_LOG), "last-run"), "") or "").split()
+    if len(last) >= 2 and re.fullmatch(r"[0-9a-f]{40}", last[1]):
+        code, so, _ = run(["git", "-C", MEMORY, "rev-list", "--count", f"{last[1]}..HEAD"])
+        if code == 0 and so.strip().isdigit():
+            return int(so.strip())
+    code, so, _ = run(["git", "-C", MEMORY, "log", "--format=%s", "-200"])
+    if code != 0:
+        return None
+    subjects = so.splitlines()
+    return next((i for i, x in enumerate(subjects) if x.startswith("Dream")), len(subjects))
 
 
 def cmd_status(repo, text):
@@ -1224,7 +1459,7 @@ def cmd_status(repo, text):
     prev = (claude.read_json(p["status"]) or {}).get("text")
     write_json(p["status"], {"text": text, "at": NOW()})
     if text and text != prev:  # the headlines' history, for the Brief
-        log_activity(repo, "status", text, by="master")
+        log_activity(repo, "status", text, by=who_am_i(repo)["role"] or "unknown")
     print("ok")
 
 
@@ -1283,10 +1518,9 @@ def cmd_recap(repo, since=None):
     s = settings(repo)
     now = NOW()
     since = int(since) if since else now - 12 * 3600_000
-    mt, minfo = master_terminal(repo)
-    msess = session_of_terminal(mt) if mt else None
-    msid = (msess or {}).get("sessionId") or minfo.get("sessionId")
-    mfacts = session_facts(msid, repo["path"], comms=True, tail=12_000_000, keep=4000) if msid else {}
+    master = master_record(repo, facts=True, comms=True, tail=12_000_000, keep=4000)
+    mt = master_terminal(repo)[0]
+    mfacts = master["facts"]
     comms = [c for c in (mfacts.get("comms") or []) if (c.get("at") or 0) >= since]
     acts = activity_since(repo, since)
     items = inbox_items(repo, include_closed=True)
@@ -1323,7 +1557,7 @@ def cmd_recap(repo, since=None):
         memory.append({"sha": sha, "at": int(ct or 0) * 1000, "subject": subj, "dream": subj.startswith("Dream")})
 
     o = org(repo)
-    master = {"terminal": (mt or {}).get("address"), "status": status_of(mt), "sessionId": msid, "facts": mfacts, "team": []}
+    master["team"] = []
     views = [manager_view(repo, m, s) for m in o["managers"]]
     managers = [{"id": m["id"], "name": m.get("name") or m["id"], "kind": m["kind"], "status": m["status"], "live": m["live"],
                  "terminal": m.get("terminal"), "goal": m.get("area") or first_sentence((m.get("handoff") or {}).get("goalFull")),
@@ -1387,6 +1621,21 @@ def cmd_loop_arm(repo):
     out({"ok": True})
 
 
+def cmd_master_open(repo):
+    """Shows the master, starting or resuming it first (master.py, which holds the lock that
+    keeps it to one master per repository)."""
+    code, so, se = run([sys.executable, MASTER_PY, "open", repo["path"], *(["--epic", repo["epic"]] if repo.get("epic") else [])], timeout=120)
+    try:
+        got = json.loads(so or "{}")
+    except ValueError:
+        got = {"error": (se or so).strip()[-300:] or f"master.py exited {code}"}
+    if got.get("error"):
+        fail(got["error"])
+    if got.get("started"):
+        log_activity(repo, "master", f"{'Resumed' if got.get('resumed') else 'Started'} the master in {got.get('address')}", by="person")
+    out(got)
+
+
 def cmd_send(addr, text):
     code, so, se = run(["hc", "send", addr, text], timeout=25)
     if code != 0:
@@ -1398,43 +1647,260 @@ def cmd_autopilot(repo):
     """The chores HQ does on its own each minute while it's open: deliver decisions, keep the
     master's loop armed, compact the master when it's idle and large. One copy at a time."""
     p = ensure(repo)
-    lock = os.path.join(p["dir"], "autopilot.lock")
+    lock = open(os.path.join(p["dir"], "autopilot.lock"), "a")
     try:
-        if time.time() - os.path.getmtime(lock) < 45:
-            out({"skipped": True})
-            return
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # held until this process exits
     except OSError:
-        pass
-    write(lock, str(os.getpid()))
+        out({"skipped": True})
+        return
     s = settings(repo)
     did = []
     n = cmd_deliver(repo)
     if n:
         did.append(f"retried {n} decision(s)")
-    mt, minfo = master_terminal(repo)
-    if mt and status_of(mt) in ("idle", "done"):
-        sess = session_of_terminal(mt)
-        facts = session_facts((sess or {}).get("sessionId") or minfo.get("sessionId"), repo["path"])
-        loop = facts.get("loop")
+    master = master_record(repo, facts=True)
+    if master["terminal"] and master["status"] in ("idle", "done"):
+        mt, facts = master_terminal(repo)[0], master["facts"]
         quiet = NOW() - (facts.get("lastAt") or NOW())
         # Only a loop that was running and lapsed is re-armed; arming one for the first time
         # is the person's call (the Arm button), since it changes how the master behaves.
-        lapsed = bool(loop and not loop.get("stopped") and loop.get("wakeAt") and NOW() > loop["wakeAt"] + 3 * 60_000)
-        if s["autoRearm"] and lapsed and quiet > 3 * 60_000:
+        lapsed = master["loop"]["state"] == "overdue"
+        if s["autoRearm"] and lapsed and quiet > LOOP_GRACE_MS:
             ok, _ = type_text(mt["address"], LOOP_PROMPT)
             if ok:
                 did.append("re-armed the master's loop")
                 log_activity(repo, "loop", "Re-armed the master's loop (it had lapsed)", by="hq")
         elif s["autoCompactMaster"] and (facts.get("context") or 0) > s["masterCompactAt"] and quiet > 60_000:
             # Compact only from a handoff the master really wrote, recently and since its last compaction.
-            h_at = int(os.path.getmtime(p["handoff"]) * 1000)
-            written = "(The master keeps this current" not in (read(p["handoff"], "") or "")
-            if written and NOW() - h_at < 3 * 3600_000 and h_at > (facts.get("compactedAt") or 0):
+            h_at = int(os.path.getmtime(p["handoff"]) * 1000) if os.path.exists(p["handoff"]) else 0
+            if h_at and NOW() - h_at < 3 * 3600_000 and h_at > (facts.get("compactedAt") or 0):
                 ok, _ = type_text(mt["address"], "/compact")
                 if ok:
                     did.append("compacted the master")
                     log_activity(repo, "compact", f"Compacted the master at {(facts.get('context') or 0) // 1000}k tokens", by="hq")
     out({"did": did})
+
+
+# ---- pull requests: state, CI checks (with the current or failing step) and description
+
+def gh_target(repo):
+    """(host, owner/name) from the repo's origin, for `gh` with GH_HOST."""
+    code, so, _ = run(["git", "-C", repo["path"], "remote", "get-url", "origin"])
+    url = so.strip()
+    # git@host:o/r, user@host:o/r, ssh://user@host/o/r, https://host/o/r
+    m = re.match(r"^(?:[a-z+]+://)?(?:[^@/]+@)?([^:/]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$", url)
+    return (m.group(1), m.group(2)) if m else ("github.com", None)
+
+
+def gh_json(host, args, timeout=30):
+    env = dict(os.environ, GH_HOST=host)
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout).strip()[-300:]
+    try:
+        return json.loads(r.stdout or "null"), None
+    except ValueError:
+        return None, "bad JSON from gh"
+
+
+def cmd_pr(repo, number):
+    host, slug = gh_target(repo)
+    fields = "number,title,state,isDraft,mergeable,reviewDecision,headRefName,baseRefName,url,author,additions,deletions,changedFiles,body,statusCheckRollup,updatedAt,mergedAt"
+    pr, err = gh_json(host, ["pr", "view", str(number), "--repo", slug, "--json", fields] if slug else ["pr", "view", str(number), "--json", fields])
+    if not pr:
+        fail(f"couldn't read PR #{number}: {err}")
+    checks = []
+    for c in pr.get("statusCheckRollup") or []:
+        if c.get("__typename") == "StatusContext":
+            st = (c.get("state") or "").upper()
+            checks.append({"name": c.get("context"), "workflow": None, "url": c.get("targetUrl"),
+                           "state": {"SUCCESS": "pass", "FAILURE": "fail", "ERROR": "fail", "PENDING": "running"}.get(st, "queued")})
+            continue
+        status, concl = (c.get("status") or "").upper(), (c.get("conclusion") or "").upper()
+        state = ("running" if status == "IN_PROGRESS" else "queued") if status != "COMPLETED" else \
+            {"SUCCESS": "pass", "FAILURE": "fail", "TIMED_OUT": "fail", "CANCELLED": "cancelled", "SKIPPED": "skipped",
+             "NEUTRAL": "skipped", "ACTION_REQUIRED": "fail", "STARTUP_FAILURE": "fail"}.get(concl, "queued")
+        checks.append({"name": c.get("name"), "workflow": c.get("workflowName"), "url": c.get("detailsUrl"), "state": state,
+                       "startedAt": c.get("startedAt"), "completedAt": c.get("completedAt")})
+    # The step a running check is on, or the step a failed one failed at (Actions jobs only).
+    for c in [x for x in checks if x["state"] in ("running", "fail")][:8]:
+        m = re.search(r"/actions/runs/\d+/job/(\d+)", c.get("url") or "")
+        if not (m and slug):
+            continue
+        job, _ = gh_json(host, ["api", f"repos/{slug}/actions/jobs/{m.group(1)}"], timeout=20)
+        steps = (job or {}).get("steps") or []
+        if c["state"] == "running":
+            cur = next((st for st in steps if st.get("status") == "in_progress"), None)
+            done = sum(1 for st in steps if st.get("status") == "completed")
+            c["step"] = {"name": cur.get("name") if cur else None, "index": done + 1, "total": len(steps)}
+        else:
+            bad = next((st for st in steps if (st.get("conclusion") or "") in ("failure", "timed_out", "cancelled")), None)
+            c["step"] = {"name": bad.get("name") if bad else None, "index": bad.get("number") if bad else None, "total": len(steps)}
+    order = {"fail": 0, "running": 1, "queued": 2, "pass": 3, "cancelled": 4, "skipped": 5}
+    checks.sort(key=lambda x: (order.get(x["state"], 9), x.get("workflow") or "", x.get("name") or ""))
+    counts = {}
+    for c in checks:
+        counts[c["state"]] = counts.get(c["state"], 0) + 1
+    out({"pr": {k: pr.get(k) for k in ("number", "title", "state", "isDraft", "mergeable", "reviewDecision", "headRefName", "baseRefName",
+                                     "url", "additions", "deletions", "changedFiles", "body", "updatedAt", "mergedAt")},
+         "author": (pr.get("author") or {}).get("login"), "checks": checks, "counts": counts, "at": NOW()})
+
+
+# ---- home: the master's written update for the person (HQ's homepage)
+
+def home_path(repo):
+    return os.path.join(paths(repo)["dir"], "home.md")
+
+
+def home_meta(repo):
+    p = home_path(repo)
+    m = claude.read_json(p + ".json") or {}
+    if os.path.exists(p):
+        m["text"] = read(p, "")
+    return m
+
+
+def cmd_home(repo, args):
+    """hq home set <file> | hq home set - (stdin) | hq home   -- the update HQ opens on."""
+    ensure(repo)
+    if not args or args[0] == "show":
+        m = home_meta(repo)
+        if not m.get("text"):
+            print("No home update yet. Write one (see 'Home' in your prompt) and publish it with `hq home set <file>`.")
+            return
+        print(f"(written {int((NOW() - (m.get('at') or NOW())) / 60000)} min ago by {m.get('by')})\n")
+        print(m["text"])
+        return
+    if args[0] != "set" or len(args) < 2:
+        fail("hq home set <file>   (or `-` to read stdin)")
+    text = sys.stdin.read() if args[1] == "-" else read(args[1])
+    if text is None:
+        fail(f"no file {args[1]}")
+    text = text.strip()
+    if len(text) < 20:
+        fail("the update is too short to be useful")
+    p = home_path(repo)
+    old = read(p, "")
+    if old and old.strip() != text:
+        hist = os.path.join(paths(repo)["dir"], "home-history")
+        os.makedirs(hist, exist_ok=True)
+        write(os.path.join(hist, time.strftime("%Y%m%d-%H%M%S") + ".md"), old)
+    write(p, text + "\n")
+    who = who_am_i(repo)
+    write_json(p + ".json", {"at": NOW(), "by": who.get("role") or who.get("terminal")})
+    log_activity(repo, "home", "Home update rewritten", by=who.get("role") or who.get("terminal"))
+    print("ok: HQ's home shows it now")
+
+
+# ---- the artifact library: what the person asked the master to make, kept and versioned
+
+ART_KINDS = {
+    "markdown": (".md", ".mdx", ".markdown"),
+    "html": (".html", ".htm"),
+    "image": (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"),
+    "pdf": (".pdf",),
+    "video": (".mp4", ".mov", ".webm"),
+    "data": (".json", ".csv", ".tsv", ".yaml", ".yml", ".toml", ".xml"),
+    "code": (".js", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".sh", ".sql", ".css", ".swift", ".java", ".rb", ".mjs"),
+    "text": (".txt", ".log"),
+    "slides": (".pptx", ".key"),
+    "doc": (".docx", ".pages", ".rtf"),
+    "sheet": (".xlsx", ".numbers"),
+}
+
+
+def art_dir(repo):
+    return os.path.join(paths(repo)["dir"], "artifacts")
+
+
+def art_kind(path):
+    ext = os.path.splitext(path)[1].lower()
+    return next((k for k, exts in ART_KINDS.items() if ext in exts), "file")
+
+
+def art_list(repo):
+    rows = []
+    for meta in glob.glob(os.path.join(art_dir(repo), "*", "meta.json")):
+        m = claude.read_json(meta)
+        if isinstance(m, dict):
+            rows.append(m)
+    rows.sort(key=lambda m: m.get("updatedAt") or 0, reverse=True)
+    return rows
+
+
+def cmd_artifact(repo, args):
+    """hq artifact add <file|folder> | --url URL  --title T [--id slug] [--summary S] [--request R] [--tags a,b]
+       hq artifact list | show <id> | rm <id>"""
+    import shutil
+    ensure(repo)
+    sub = args[0] if args else "list"
+    o, rest = todo_opts(args[1:])
+    if sub == "list":
+        rows = art_list(repo)
+        if not rows:
+            print("The library is empty. Store something with `hq artifact add <file> --title ...`.")
+        for m in rows:
+            print(f"{m['id']:28} {m['kind']:9} v{len(m.get('versions', []))}  {m['title']}")
+        return
+    if sub == "json":
+        return out({"artifacts": art_list(repo)})
+    if sub in ("show", "rm"):
+        aid = rest[0] if rest else fail(f"hq artifact {sub} <id>")
+        d = os.path.join(art_dir(repo), aid)
+        m = claude.read_json(os.path.join(d, "meta.json")) or fail(f"no artifact {aid}")
+        if sub == "show":
+            print(json.dumps(m, indent=1))
+            return
+        shutil.rmtree(d)
+        log_activity(repo, "artifact", f"Removed '{m['title']}'", by="person")
+        return out({"ok": True})
+    if sub != "add":
+        fail("hq artifact add <file|folder> --title T ... | --url URL --title T ... | list | show <id> | rm <id>")
+    src = rest[0] if rest else None
+    url = o.get("url")
+    if not src and not url:
+        fail("give a file or folder to store, or --url")
+    if src and not os.path.exists(src):
+        fail(f"no such file: {src}")
+    title = o.get("title") or (os.path.basename(src.rstrip("/")) if src else url)
+    aid = slugify(o.get("id") or title)[:60]
+    d = os.path.join(art_dir(repo), aid)
+    m = claude.read_json(os.path.join(d, "meta.json")) or {
+        "id": aid, "title": title, "createdAt": NOW(), "versions": []}
+    v = len(m["versions"]) + 1
+    vdir = os.path.join(d, f"v{v}")
+    os.makedirs(vdir, exist_ok=True)
+    main, files = None, []
+    if src:
+        src = os.path.abspath(src)
+        if os.path.isdir(src):
+            dest = os.path.join(vdir, os.path.basename(src.rstrip("/")))
+            shutil.copytree(src, dest, ignore=shutil.ignore_patterns("node_modules", ".git", "target", "__pycache__"))
+            for root, _, fns in os.walk(dest):
+                files += [os.path.relpath(os.path.join(root, f), vdir) for f in fns]
+            entry = next((f for f in files if os.path.basename(f).lower() in ("index.html", "readme.md")), None)
+            main = entry or (sorted(files)[0] if files else None)
+        else:
+            shutil.copy2(src, vdir)
+            main = os.path.basename(src)
+            files = [main]
+    kind = "link" if not src else ("folder" if os.path.isdir(src) and not main else art_kind(main or ""))
+    who = who_am_i(repo)
+    m.update({
+        "title": title, "kind": kind, "summary": o.get("summary", m.get("summary", "")),
+        "request": o.get("request", m.get("request", "")),
+        "tags": [x.strip() for x in o.get("tags", ",".join(m.get("tags", []))).split(",") if x.strip()],
+        "url": url or m.get("url"), "updatedAt": NOW(), "by": who.get("role") or who.get("terminal"),
+        "main": f"v{v}/{main}" if main else None, "dir": d,
+    })
+    m["versions"].append({"v": v, "at": NOW(), "main": m["main"], "files": files[:200], "source": src, "url": url,
+                          "note": o.get("note", "")})
+    write_json(os.path.join(d, "meta.json"), m)
+    log_activity(repo, "artifact", f"{'Updated' if v > 1 else 'Stored'} '{title}' (v{v})", by=m["by"])
+    print(f"{aid}  stored as v{v} in HQ > Library{' (' + m['main'] + ')' if m['main'] else ''}")
 
 
 # ---- next moves: the master's to-do list, steered by the person
@@ -1583,6 +2049,416 @@ def cmd_todo(repo, args):
         log_activity(repo, "todo", f"Vetoed '{it['title']}'" + (f": {clip(text, 80)}" if text else ""), by="person")
         return out({"ok": True})
     fail("hq todo [list | add | set <id> | start <id> | block <id> [on what] | done <id> | drop <id>]")
+
+
+# ---- the roadmap: each epic's plan in phases, kept by the master
+
+GROUPS_FILE = os.path.join(APP, "data", "my-spaces", "groups.json")
+PHASE_STATUS = ("done", "doing", "next", "later", "blocked")
+ITEM_STATUS = ("done", "doing", "todo")
+EPIC_STATUS = ("on track", "at risk", "blocked", "paused", "done")
+ROADMAP_GUIDE = """The roadmap is each epic's plan, in phases. An epic is one of the person's worktree groups
+(the my-spaces sidebar groups worktrees into epics); each gets its own page in HQ > Roadmap, the
+phases drawn left to right, phases that can run at the same time stacked side by side.
+
+You keep it: `hq roadmap set <file.json>` checks and publishes it (a bad file is refused with every
+problem listed; fix and retry). `hq roadmap seed` prints a start: every epic of this repo with its
+worktrees as hints and the phases you already published.
+
+Shape:
+  {"epics": [{"group": "<the group's name, exactly>", "goal": "<one plain sentence: what done looks like>",
+              "status": "on track|at risk|blocked|paused|done", "note"?: "<one line: what to know now>",
+              "phases": [{"id": "<lowercase-dashes>", "title": "<= 60 chars", "summary": "<= 160 chars",
+                          "status": "done|doing|next|later|blocked", "after"?: ["<phase id>", ...],
+                          "owner"?: "<manager id or person>", "eta"?: "<short, like 'this week'>",
+                          "items"?: [{"label": "<= 80 chars", "status": "done|doing|todo", "link"?: "<url>"}]}]}]}
+
+`after` lists the phases that must finish first. Phases with the same `after` run in parallel. No
+`after` means it can start now. Keep 3 to 8 phases per epic and up to 6 items per phase (PRs, units,
+decisions). Write like you talk to the person: plain words, no jargon, no internal codenames they
+wouldn't know. Say what each phase gets them, not how. Update it when a phase starts, finishes or
+gets stuck, and when the plan changes."""
+
+
+def roadmap_path(repo):
+    return os.path.join(paths(repo)["dir"], "roadmap.json")
+
+
+def repo_groups(repo):
+    """The person's worktree groups (epics) for this repo: name -> its worktrees' folder names."""
+    groups = claude.read_json(GROUPS_FILE) or {}
+    base = os.path.basename(repo["path"].rstrip("/"))
+    out_ = {}
+    for path, name in groups.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        parent = os.path.basename(os.path.dirname(path.rstrip("/")))
+        if parent == base or path.startswith(repo["path"].rstrip("/") + "/"):
+            out_.setdefault(name, []).append(os.path.basename(path.rstrip("/")))
+    return out_
+
+
+def roadmap_load(repo):
+    return claude.read_json(roadmap_path(repo)) or {"epics": []}
+
+
+def roadmap_check(doc):
+    issues = []
+    add = lambda where, what: issues.append(f"{where}: {what}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("epics"), list):
+        return ["(document): needs {\"epics\": [...]}"]
+    seen = set()
+    for i, e in enumerate(doc["epics"]):
+        w = f"epics[{i}]"
+        if not isinstance(e, dict):
+            add(w, "must be an object"); continue
+        g = e.get("group")
+        if not isinstance(g, str) or not g.strip():
+            add(w, "needs a group (the worktree group's name)"); continue
+        w = f"epic '{g}'"
+        if g in seen:
+            add(w, "listed twice")
+        seen.add(g)
+        if e.get("status", "on track") not in EPIC_STATUS:
+            add(w, f"status must be one of {', '.join(EPIC_STATUS)}")
+        if len(e.get("goal") or "") > 200:
+            add(w, "goal is longer than 200 chars")
+        phases = e.get("phases") or []
+        if not isinstance(phases, list):
+            add(w, "phases must be a list"); continue
+        ids = {}
+        for k, ph in enumerate(phases):
+            pw = f"{w} phase {k + 1}"
+            if not isinstance(ph, dict):
+                add(pw, "must be an object"); continue
+            pid = ph.get("id")
+            if not isinstance(pid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", pid):
+                add(pw, "id must be lowercase letters, digits and dashes"); continue
+            if pid in ids:
+                add(pw, f"id '{pid}' used twice")
+            ids[pid] = ph
+            if not (ph.get("title") or "").strip():
+                add(pw, "needs a title")
+            if len(ph.get("title") or "") > 60:
+                add(pw, "title is longer than 60 chars")
+            if len(ph.get("summary") or "") > 160:
+                add(pw, "summary is longer than 160 chars")
+            if ph.get("status") not in PHASE_STATUS:
+                add(pw, f"status must be one of {', '.join(PHASE_STATUS)}")
+            items = ph.get("items") or []
+            if not isinstance(items, list) or len(items) > 12:
+                add(pw, "items must be a list of at most 12")
+                continue
+            for j, it in enumerate(items):
+                if not isinstance(it, dict) or not (it.get("label") or "").strip():
+                    add(f"{pw} item {j + 1}", "needs a label")
+                elif it.get("status", "todo") not in ITEM_STATUS:
+                    add(f"{pw} item {j + 1}", f"status must be one of {', '.join(ITEM_STATUS)}")
+                elif len(it["label"]) > 80:
+                    add(f"{pw} item {j + 1}", "label is longer than 80 chars")
+        for pid, ph in ids.items():
+            for a in ph.get("after") or []:
+                if a not in ids:
+                    add(f"{w} phase '{pid}'", f"after names '{a}', which isn't a phase of this epic")
+        # No loops in `after`.
+        state = {}
+        def visit(pid, trail):
+            if state.get(pid) == 2:
+                return
+            if state.get(pid) == 1:
+                add(w, "phases wait on each other in a loop: " + " -> ".join(trail + [pid]))
+                return
+            state[pid] = 1
+            for a in ids.get(pid, {}).get("after") or []:
+                if a in ids:
+                    visit(a, trail + [pid])
+            state[pid] = 2
+        for pid in ids:
+            visit(pid, [])
+    return issues
+
+
+def cmd_roadmap_status(repo):
+    print(ROADMAP_GUIDE)
+    doc = roadmap_load(repo)
+    groups = repo_groups(repo)
+    have = {e.get("group"): e for e in doc.get("epics", [])}
+    print()
+    print("Epics of this repo (worktree groups):" if groups else "This repo has no worktree groups yet: nothing to plan.")
+    for g, wts in sorted(groups.items()):
+        e = have.get(g)
+        if e:
+            ph = e.get("phases") or []
+            done = sum(1 for x in ph if x.get("status") == "done")
+            print(f"- {g}: {done}/{len(ph)} phases done, {e.get('status', 'on track')}")
+        else:
+            print(f"- {g}: no plan yet ({len(wts)} worktrees)")
+    if doc.get("at"):
+        print(f"Last published {int((NOW() - doc['at']) / 60000)} min ago by {doc.get('by') or 'someone'}: {roadmap_path(repo)}")
+
+
+def cmd_roadmap_seed(repo):
+    doc = roadmap_load(repo)
+    have = {e.get("group"): e for e in doc.get("epics", [])}
+    epics = []
+    for g, wts in sorted(repo_groups(repo).items()):
+        e = dict(have.get(g) or {"group": g, "goal": "", "status": "on track", "phases": []})
+        e["_worktrees"] = sorted(wts)
+        epics.append(e)
+    print(json.dumps({"epics": epics}, indent=1))
+
+
+def cmd_roadmap_set(repo, src):
+    ensure(repo)
+    text = read(src)
+    if text is None:
+        fail(f"no file {src}")
+    try:
+        doc = json.loads(text)
+    except ValueError as e:
+        print(f"The roadmap was NOT updated: {src} isn't valid JSON ({e}).")
+        sys.exit(1)
+    issues = roadmap_check(doc)
+    if issues:
+        print("The roadmap was NOT updated. Fix these and run hq roadmap set again:")
+        for i in issues:
+            print(f"- {i}")
+        sys.exit(1)
+    for e in doc["epics"]:
+        e.pop("_worktrees", None)
+    who = who_am_i(repo)
+    doc = {"epics": doc["epics"], "at": NOW(), "by": who.get("role") or who.get("terminal")}
+    write_json(roadmap_path(repo), doc)
+    unknown = sorted({e["group"] for e in doc["epics"]} - set(repo_groups(repo)))
+    log_activity(repo, "roadmap", f"Roadmap updated: {len(doc['epics'])} epics", by=doc["by"])
+    print(f"ok: roadmap published ({len(doc['epics'])} epics), shown in HQ > Roadmap")
+    if unknown:
+        print(f"note: no worktree group named {', '.join(unknown)}; those epics still show, under 'Other plans'.")
+
+
+# ---- merged PRs over the last two weeks (Home's chart), from GitHub, cached and refreshed in the background
+
+MERGES_TTL = 300_000
+MERGES_DAYS = 14
+
+
+def merges_path(repo):
+    return os.path.join(paths(repo)["dir"], "merges.json")
+
+
+def merges_refresh(repo):
+    """Counts merged PRs per local day (14 days) and per hour today; writes merges.json."""
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - (MERGES_DAYS - 1) * 86400))
+    code, so, se = run(["gh", "pr", "list", "--state", "merged", "--search", f"merged:>={since}", "--limit", "2000",
+                        "--json", "number,mergedAt,author,title"], timeout=60, cwd=repo["path"])
+    if code != 0:
+        prev = claude.read_json(merges_path(repo)) or {}
+        write_json(merges_path(repo), {**prev, "at": NOW(), "error": (se or so).strip()[-200:]})
+        return
+    prs = json.loads(so or "[]")
+    titles = {str(p["number"]): p.get("title") or "" for p in prs}
+    c2, so2, _ = run(["gh", "pr", "list", "--state", "open", "--limit", "400", "--json", "number,title"], timeout=60, cwd=repo["path"])
+    if c2 == 0:
+        titles.update({str(p["number"]): p.get("title") or "" for p in json.loads(so2 or "[]")})
+    today = time.strftime("%Y-%m-%d")
+    days = {time.strftime("%Y-%m-%d", time.localtime(time.time() - k * 86400)): 0 for k in range(MERGES_DAYS - 1, -1, -1)}
+    hours = [0] * 24
+    authors = {}
+    for pr in prs:
+        try:
+            ts = calendar.timegm(time.strptime(pr["mergedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        except (KeyError, ValueError):
+            continue
+        day = time.strftime("%Y-%m-%d", time.localtime(ts))
+        if day in days:
+            days[day] += 1
+        if day == today:
+            hours[time.localtime(ts).tm_hour] += 1
+            who = (pr.get("author") or {}).get("login") or "?"
+            authors[who] = authors.get(who, 0) + 1
+    write_json(merges_path(repo), {"at": NOW(), "days": [{"date": d, "count": n} for d, n in days.items()], "hours": hours,
+                                   "authors": sorted(authors.items(), key=lambda x: -x[1])[:5], "titles": titles})
+
+
+def merges_snapshot(repo):
+    """The cached counts; a stale cache starts a background refresh (gh takes a few seconds)."""
+    m = claude.read_json(merges_path(repo)) or {}
+    lock = merges_path(repo) + ".lock"
+    fresh_lock = os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 120
+    if NOW() - (m.get("at") or 0) > MERGES_TTL and not fresh_lock:
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        write(lock, str(os.getpid()))
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--repo", repo["path"], "merges-refresh"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return {k: v for k, v in m.items() if k != "titles"}
+
+
+# ---- the merge queue (HQ > Queue): the queue engine's state.json, summarised
+
+QUEUE_LIVE = ("ci", "green", "red", "error", "stale", "trunk-check")
+
+
+def queue_state_path(repo):
+    base = os.path.basename(repo["path"].rstrip("/"))
+    found = glob.glob(os.path.join(HOME, ".herdr", "worktrees", base, "*", ".audit", "*", "queue", "state.json"))
+    found += glob.glob(os.path.join(repo["path"], ".audit", "*", "queue", "state.json"))
+    return max(found, key=os.path.getmtime) if found else None
+
+
+def iso_ms(s):
+    if not s:
+        return None
+    try:
+        return int(calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")) * 1000)
+    except ValueError:
+        return None
+
+
+def pr_base(repo):
+    """https://<host>/<owner>/<repo>/pull/ from the origin remote (ssh or https)."""
+    code, so, _ = run(["git", "-C", repo["path"], "remote", "get-url", "origin"], timeout=5)
+    m = re.match(r"(?:ssh://|https://)?(?:[^@/]+@)?([^/:]+)[:/](.+?)(?:\.git)?$", so.strip()) if code == 0 else None
+    return f"https://{m.group(1)}/{m.group(2)}/pull/" if m else None
+
+
+def queues_snapshot(repo, managers):
+    """One summary per merge-queue manager (its epic's queue); a queue found with no manager too."""
+    out_, seen_paths = [], set()
+    for m in managers:
+        if m.get("kind") != "merge-queue" or m.get("status") == "retired":
+            continue
+        hit = glob.glob(os.path.join(m.get("worktree") or "/nonexistent", ".audit", "*", "queue", "state.json"))
+        q = queue_snapshot(repo, hit[0] if hit else None) if hit else None
+        if hit:
+            seen_paths.add(hit[0])
+        out_.append({**(q or {"missing": True}), "epic": m.get("group"), "manager": m["id"], "terminal": m.get("terminal"),
+                     "status": m.get("status"), "trunk": m.get("trunk")})
+    loose = queue_state_path(repo)
+    if loose and loose not in seen_paths and not out_:
+        q = queue_snapshot(repo, loose)
+        if q:
+            out_.append({**q, "epic": None, "manager": None})
+    return out_
+
+
+def queue_snapshot(repo, path=None):
+    path = path or queue_state_path(repo)
+    st = claude.read_json(path) if path else None
+    if not st:
+        return None
+    titles = (claude.read_json(merges_path(repo)) or {}).get("titles") or {}
+    seen = st.get("seen") or {}
+    closed = set(st.get("closed") or [])
+    queued = st.get("queued") or {}
+    rejected = st.get("rejected") or {}
+    held = st.get("held") or {}
+    owners = st.get("owners") or {}
+    t0 = time.mktime(time.localtime()[:3] + (0, 0, 0) + time.localtime()[6:])  # local midnight
+    want = set()
+
+    def member(m):
+        want.add(str(m["pr"]))
+        k = f"{m['pr']}:{m['sha']}"
+        return {"pr": m["pr"], "owner": m.get("owner"), "seen": iso_ms(seen.get(k)), "parent": m.get("stack_parent")}
+
+    def batch(b):
+        created, ci_end, merged = iso_ms(b.get("created")), iso_ms(b.get("ci_end")), iso_ms(b.get("merged"))
+        return {"n": b["n"], "status": b["status"], "trunk": b.get("trunk"), "failing": b.get("failing"), "reruns": b.get("reruns", 0),
+                "created": created, "ciEnd": ci_end, "merged": merged, "pr": b.get("pr"), "members": [member(m) for m in b.get("members") or []]}
+
+    batches = st.get("batches") or []
+    live = [batch(b) for b in batches if b["status"] in QUEUE_LIVE]
+    recent = [batch(b) for b in batches if b["status"] in ("done", "released")][-12:][::-1]
+    # Waiting: READY lines the scanner has seen whose PR is open and not yet queued, rejected or in a live batch.
+    in_live = {m["pr"] for b in live for m in b["members"]}
+    waiting = {}
+    for k, at in seen.items():
+        pr_s, _, sha = k.partition(":")
+        pr = int(pr_s)
+        if pr in closed or pr in in_live or k in queued or k in rejected:
+            continue
+        cur = waiting.get(pr)
+        if not cur or (iso_ms(at) or 0) > cur["since"]:
+            waiting[pr] = {"pr": pr, "since": iso_ms(at) or 0, "owner": owners.get(pr_s), "held": held.get(k),
+                           "after": (st.get("after") or {}).get(pr_s), "priority": pr in (st.get("priority") or [])}
+    for w in waiting.values():
+        want.add(str(w["pr"]))
+    # Today, from finished batches.
+    today = [b for b in batches if (iso_ms(b.get("created")) or 0) >= t0 * 1000]
+    landed = [b for b in today if b["status"] == "done" or b["status"] == "trunk-check"]
+    ci_mins = sorted(((iso_ms(b["ci_end"]) - iso_ms(b["created"])) / 60000) for b in batches[-12:] if b.get("ci_end") and b.get("created"))
+    waits = sorted(((iso_ms(b["merged"]) - (iso_ms(seen.get(f"{m['pr']}:{m['sha']}")) or iso_ms(b["created"]))) / 60000)
+                   for b in landed if b.get("merged") for m in b.get("members") or [])
+    med = lambda xs: xs[len(xs) // 2] if xs else None
+    rej = []
+    for k, why in list(rejected.items())[-4:][::-1]:
+        pr_s = k.partition(":")[0]
+        want.add(pr_s)
+        rej.append({"pr": int(pr_s), "why": clip(why, 220)})
+    return {
+        "at": int(os.path.getmtime(path) * 1000), "path": path, "nextBatch": st.get("next_batch"), "prBase": pr_base(repo),
+        "live": live, "recent": recent, "waiting": sorted(waiting.values(), key=lambda w: w["since"]),
+        "rules": {"after": st.get("after") or {}, "apart": st.get("apart") or [], "priority": st.get("priority") or [], "soloOk": st.get("solo_ok") or []},
+        "rejected": rej, "throughput": st.get("throughput"),
+        "today": {"batches": len(today), "landedBatches": len(landed), "prs": sum(len(b.get("members") or []) for b in landed),
+                  "failed": sum(1 for b in today if b["status"] == "released" or b.get("failing")),
+                  "ciMin": med(ci_mins), "waitMin": med(waits)},
+        "titles": {k: titles[k] for k in want if k in titles},
+    }
+
+
+def my_epic(repo):
+    """The epic this scope's master runs: the scope's own, or the main master's."""
+    return repo.get("epic") or registry.main_epic(repo)
+
+
+def all_scopes(repo):
+    """This scope and the repo's other masters' scopes (each epic's own HQ data)."""
+    base = {k: v for k, v in repo.items() if k not in ("epic", "repoKey")}
+    if repo.get("epic"):
+        base.update(key=repo["repoKey"], name=repo["name"].split(" · ")[0])
+    out_ = [base]
+    for ep in registry.epic_masters(repo):
+        sc = registry.scope_of(base, ep) if ep else base
+        if sc["key"] != base["key"]:
+            out_.append(sc)
+    return out_
+
+
+def roadmap_merged(repo):
+    """Every epic's plan, from whichever master runs it (its own plan wins over another's)."""
+    plans, at, by = {}, None, None
+    for sc in all_scopes(repo):
+        doc = roadmap_load(sc)
+        mine = my_epic(sc)
+        for e in doc.get("epics", []):
+            if e.get("group") == mine or e.get("group") not in plans:
+                plans[e.get("group")] = e
+        if doc.get("at") and (not at or doc["at"] > at):
+            at, by = doc["at"], doc.get("by")
+    return {"epics": list(plans.values()), "at": at, "by": by}
+
+
+def epics_snapshot(repo):
+    """Every worktree group of the repo and its master (address and state), the current one marked."""
+    regs = registry.epic_masters(repo)
+    rows = {t["address"]: t for t in hc_ls()}
+    mine = my_epic(repo)
+    out_ = []
+    for g in sorted(set(repo_groups(repo)) | {e for e in regs if e}):
+        e = regs.get(g)
+        t = rows.get((e or {}).get("terminal"))
+        out_.append({"name": g, "current": g == mine, "main": bool(e) and "#" not in e["key"],
+                     "master": (e or {}).get("terminal") if t else None,
+                     "status": (t or {}).get("status") if t else ("gone" if e else None)})
+    return out_
+
+
+def roadmap_snapshot(repo):
+    doc = roadmap_merged(repo)
+    groups = repo_groups(repo)
+    return {"at": doc.get("at"), "by": doc.get("by"), "epics": doc.get("epics", []),
+            "groups": [{"name": g, "worktrees": len(w)} for g, w in sorted(groups.items())]}
 
 
 # ---- the live map: a PR Lens graph of the org and its work, kept by the master
@@ -1799,10 +2675,14 @@ def cmd_dream(repo):
 
 def main(argv):
     args = argv[1:]
-    folder = None
+    folder = epic = None
     if "--repo" in args:
         i = args.index("--repo")
         folder = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    if "--epic" in args:
+        i = args.index("--epic")
+        epic = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
     if not args:
         print(__doc__)
@@ -1817,7 +2697,11 @@ def main(argv):
             return cmd_memory()
         if cmd == "memory-show":
             return cmd_memory_show(a[0])
-        repo = repo_for(folder)
+        repo = repo_for(folder, epic)
+        if cmd in wfo.COMMANDS:
+            if a[:1] == ["help"]:
+                return print(wfo.HELP)
+            return wfo.COMMANDS[cmd](sys.modules[__name__], repo, a)
         if cmd == "ask":
             if not a or a[0] not in ("approval", "question"):
                 fail("hq ask approval|question --title T --body B")
@@ -1840,6 +2724,10 @@ def main(argv):
             return cmd_snapshot(repo)
         if cmd == "inbox":
             return out({"items": inbox_items(repo, include_closed="--all" in a)})
+        if cmd == "reopen":
+            return cmd_reopen(repo, a[0])
+        if cmd == "resolve":
+            return cmd_resolve(repo, a[0], " ".join(a[1:]))
         if cmd == "decide":
             return cmd_decide(repo, a[0], a[1], " ".join(a[2:]))
         if cmd == "deliver":
@@ -1867,8 +2755,30 @@ def main(argv):
             return cmd_recap(repo, a[1] if len(a) > 1 else None)
         if cmd == "discover":
             return cmd_discover(repo)
+        if cmd == "pr":
+            return cmd_pr(repo, a[0].lstrip("#"))
+        if cmd == "home":
+            return cmd_home(repo, a)
+        if cmd == "artifact":
+            return cmd_artifact(repo, a)
         if cmd == "todo":
             return cmd_todo(repo, a)
+        if cmd == "merges-refresh":
+            try:
+                return merges_refresh(repo)
+            finally:
+                try:
+                    os.remove(merges_path(repo) + ".lock")
+                except OSError:
+                    pass
+        if cmd == "roadmap":
+            if not a:
+                return cmd_roadmap_status(repo)
+            if a[0] == "set" and len(a) > 1:
+                return cmd_roadmap_set(repo, a[1])
+            if a[0] == "seed":
+                return cmd_roadmap_seed(repo)
+            fail("hq roadmap [set <file> | seed]")
         if cmd == "lens":
             if not a:
                 return cmd_lens_status(repo)
@@ -1885,6 +2795,8 @@ def main(argv):
             return cmd_adopt(repo, a[0], a[1], a[2] if len(a) > 2 else "area")
         if cmd == "loop-arm":
             return cmd_loop_arm(repo)
+        if cmd == "master-open":
+            return cmd_master_open(repo)
         if cmd == "autopilot":
             return cmd_autopilot(repo)
         if cmd == "dream":
