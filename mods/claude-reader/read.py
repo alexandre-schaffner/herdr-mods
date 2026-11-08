@@ -2,9 +2,9 @@
 
   python3 -I read.py --pid <pid> --cwd <dir> [--path <jsonl>] [--offset <bytes>]
 
-Finds the session a terminal runs (`pid`: its shell or claude itself; any account's
-sessions/<pid>.json whose process sits under it → projects/<slug>/<sessionId>.jsonl, else
-the newest transcript for the folder),
+Finds the session a terminal runs (`pid`: its shell or claude itself; the claude under it,
+named by any account's sessions/<pid>.json or else its `--session-id`/`--resume` argument →
+projects/<slug>/<sessionId>.jsonl, else the folder's newest transcript no running claude owns),
 parses the lines after `offset` and prints one JSON object: the events, the new offset
 and session facts. Only complete lines are consumed, so a line being written is read
 on the next call. Big tool outputs are clipped; on a huge first read the oldest events
@@ -18,7 +18,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "shared"))
-from claude import ANSI, PROJECTS, find_transcript, save_image, session_in, slug  # noqa: E402
+from claude import ANSI, PROJECTS, claimed_sessions, find_transcript, save_image, session_of, slug  # noqa: E402
 
 OUT_BUDGET = 5_500_000
 RESULT_HEAD, RESULT_TAIL = 2600, 900
@@ -30,19 +30,21 @@ LOCAL_OUT = TAG("local-command-stdout")
 BASH_IN, BASH_OUT, BASH_ERR = TAG("bash-input"), TAG("bash-stdout"), TAG("bash-stderr")
 SUMMARY, STATUS = TAG("summary"), TAG("status")
 def newest(folder):
+    """The folder's newest transcript that no running claude owns: a terminal whose session
+    can't be named (claude exited) may show its last one, never another live session's."""
+    taken = claimed_sessions()
     try:
-        files = [os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".jsonl")]
+        files = [os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".jsonl") and n[:-6] not in taken]
     except OSError:
         return None
     return max(files, key=os.path.getmtime) if files else None
 
 
 def resolve(pid, cwd, given):
-    s = session_in([int(pid)]) if str(pid).isdigit() else None
+    s = session_of([int(pid)]) if str(pid).isdigit() else None
     if s:
-        p = find_transcript(s["sessionId"], s.get("cwd") or cwd)
-        if p:
-            return p, s
+        # A known session with no transcript yet shows nothing rather than a neighbour's.
+        return find_transcript(s["sessionId"], s.get("cwd") or cwd), s
     if given and os.path.exists(given):
         return given, None
     if cwd:

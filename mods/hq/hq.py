@@ -351,10 +351,7 @@ def master_terminal(repo):
 
 
 def session_of_terminal(t):
-    if not t:
-        return None
-    s = claude.session_in(claude.terminal_pids(t))
-    return s
+    return claude.session_of(claude.terminal_pids(t)) if t else None
 
 
 # ---- transcripts: context size, what it is doing, the loop

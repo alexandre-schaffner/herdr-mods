@@ -77,6 +77,7 @@ def sessions(dirs=None):
 
 
 _PARENTS = None
+_COMMANDS = {}
 
 
 def _parents():
@@ -84,13 +85,14 @@ def _parents():
     if _PARENTS is None:
         _PARENTS = {}
         try:
-            out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(["ps", "-Aww", "-o", "pid=,ppid=,command="], capture_output=True, text=True, timeout=10).stdout
         except (OSError, subprocess.SubprocessError):
             out = ""
         for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                 _PARENTS[int(parts[0])] = int(parts[1])
+                _COMMANDS[int(parts[0])] = parts[2] if len(parts) == 3 else ""
     return _PARENTS
 
 
@@ -122,6 +124,42 @@ def session_in(pids, dirs=None):
         if d is not None and (depth is None or d < depth):
             best, depth = s, d
     return best
+
+
+SESSION_ARG = re.compile(r"(?:^|\s)(?:--session-id|--resume|-r)(?:=|\s+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
+
+
+def _argv_sessions():
+    """pid → the session id on a running claude's command line (`--session-id`/`--resume`)."""
+    _parents()
+    out = {}
+    for pid, cmd in _COMMANDS.items():
+        first = cmd.split(None, 1)[0] if cmd else ""
+        m = SESSION_ARG.search(cmd) if os.path.basename(first) == "claude" and "--fork-session" not in cmd else None
+        if m:
+            out[pid] = m.group(1)
+    return out
+
+
+def session_of(pids, dirs=None):
+    """The session a terminal runs: the claude closest under `pids`, by its live session file,
+    else by the id on its command line. Claude Code writes sessions/<pid>.json late, so a fresh
+    session has none yet: without the command line, two sessions in one folder (an epic's
+    master and the main one) can't be told apart, and a `claude -p` it runs would pass for it."""
+    pids = {p for p in pids if isinstance(p, int)}
+    best, rank = None, None
+    found = [(s["pid"], 0, s) for s in sessions(dirs).values() if s["alive"]]
+    found += [(pid, 1, {"sessionId": sid, "pid": pid, "alive": True, "fromArgv": True}) for pid, sid in _argv_sessions().items()]
+    for pid, pref, s in found:
+        d = next((i for i, p in enumerate(lineage(pid)) if p in pids), None)
+        if d is not None and (rank is None or (d, pref) < rank):
+            best, rank = s, (d, pref)
+    return best
+
+
+def claimed_sessions(dirs=None):
+    """Session ids some running claude owns: live session files and command lines."""
+    return {sid for sid, s in sessions(dirs).items() if s["alive"]} | set(_argv_sessions().values())
 
 
 def find_transcript(session_id, cwd=None):
