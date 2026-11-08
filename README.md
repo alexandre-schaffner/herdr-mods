@@ -9,7 +9,6 @@ Herdr's shipped mods, state and caches.
 | `workflows` | Claude Code dynamic workflows as a live graph (left to right or top to bottom), each agent's shell as a terminal, the owning session's live terminal, run outputs, and a workflow editor and library (`cmd-shift-g`; `cmd-s` saves, `cmd-enter` generates) |
 | `master` | `cmd-alt-m`: go to the repo's master chat, starting or resuming it in a pinned Master tab (`master.py`, prompt `master.md`, state in `data/master/masters.json`) |
 | `claude-reader` | A Claude Code chat as a clean, live document, over or beside its terminal (`cmd-shift-m`) |
-| `viewer` | Images, videos, Markdown and PDFs, opened from other mods |
 | `claude-picker` | Account, model and effort for Claude: a dialog when starting a Claude tab, a popup to switch model and effort live. Accounts in `accounts.json` |
 | `my-tabs` | Tabs, cloned from Herdr's `tabs`: per-panel widths, a Workflows panel button; its + opens `my-new-menu` |
 | `my-new-menu` | The + menu, cloned from Herdr's `new-menu`: Claude goes through `claude-picker` |

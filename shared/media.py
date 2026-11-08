@@ -1,4 +1,4 @@
-"""The viewer's file work: everything it shows is staged here first.
+"""Image and video staging for mods that show thumbnails (Workflows): files are staged here first.
 
   python3 -I media.py <command> <file> [args]   → one JSON object on stdout
 
@@ -25,7 +25,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-APP_HOME = os.path.dirname(os.path.dirname(HERE))
+APP_HOME = os.path.dirname(HERE)
 CACHE = os.path.join(HERE, ".cache")  # hidden: writing here doesn't reload the mod
 
 MAX_IMAGE = 3200  # px, longest edge of a staged image

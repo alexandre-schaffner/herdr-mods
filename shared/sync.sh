@@ -9,7 +9,6 @@ cd "$(dirname "$0")/.."
 MANIFEST="
 workflows      look.js media-kinds.js viewer-link.js
 claude-reader  look.js media-kinds.js viewer-link.js
-viewer         look.js media-kinds.js
 claude-picker  claude-state.js
 my-pane        claude-state.js
 "

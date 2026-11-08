@@ -1,14 +1,15 @@
-// The link to the `viewer` mod (images, videos, Markdown and PDFs): which files it takes,
-// how to open one, links in rendered Markdown that may point at one, and thumbnails.
+// Media files from other mods (images, videos, Markdown and PDFs): which files count,
+// how to open one (the system's default app), links in rendered Markdown that may point
+// at one, and thumbnails (shared/media.py).
 
-import { appHome, exec, home, openOverlay } from "herdr";
+import { appHome, exec, home } from "herdr";
 import { kindOf } from "./media-kinds.js";
 
 export const viewable = path => typeof path === "string" && path.startsWith("/") && kindOf(path) !== null;
 
-/** Opens `file` in the viewer; `files` (with `file` among them) can be stepped through there. */
-export function openViewer(file, files) {
-  openOverlay({ mod: "viewer", kind: "dialog", width: 0.86, height: 0.9, props: { file, files: files?.length ? files : [file] } });
+/** Opens `file` in the system's default app (`files` is accepted and ignored). */
+export function openViewer(file, _files) {
+  exec("open", [file]).catch(() => exec("xdg-open", [file]).catch(() => {}));
 }
 
 /** A link's local file, if it names one: absolute, `~/`, `file://`, or relative to `cwd`. */
@@ -20,7 +21,7 @@ function localPath(url, cwd) {
   return p && p.replace(/\/\.\//g, "/");
 }
 
-/** For `TextView.on_link_click`: viewable files open in the viewer, the rest as the system would. */
+/** For `TextView.on_link_click`: local files and URLs open as the system would. */
 export function openLink(url, cwd) {
   if (!url || url.startsWith("#")) return;
   const path = localPath(url, cwd);
@@ -29,12 +30,12 @@ export function openLink(url, cwd) {
 }
 
 /**
- * A thumbnail for `file` through the viewer's own staging (media.py): `{ src, width, height }`
+ * A thumbnail for `file` through shared/media.py: `{ src, width, height }`
  * for an image, `{ src, width, height, duration }` (src: the poster) for a video. Null when
- * the viewer isn't installed or can't read it.
+ * it can't be read.
  */
 export async function stage(kind, file) {
-  const r = await exec("python3", ["-I", `${appHome()}/mods/viewer/media.py`, kind, file]);
+  const r = await exec("python3", ["-I", `${appHome()}/shared/media.py`, kind, file]);
   let out;
   try {
     out = JSON.parse(r.stdout);
