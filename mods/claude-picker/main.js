@@ -1,11 +1,12 @@
 // Claude: pick the account, model and effort.
 //   Launch: props { space, name, base } (from the + menu): starts a Claude tab with them.
 //   Live:   props { terminal } (from a Claude pane's header): switches model and effort in the
-//           running session with /model and /effort. The account is fixed once it started.
+//           running session with /model and /effort. Another account restarts Claude in the
+//           tab's shell with --resume: same conversation, new account.
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { theme, props, run, hc, exec, terminals, panes, closeOverlay, shared, setShared, notify } from "herdr";
-import { loadConfig, account, launchArgv, stateOf, modelLabel, effortLabel } from "./claude.js";
+import { loadConfig, account, launchArgv, labelArgs, resumeLine, sessionAt, stateOf, modelLabel, effortLabel } from "./claude.js";
 
 const LAST = "claude-picker.last";
 
@@ -18,6 +19,11 @@ async function foregroundArgv(addr) {
 }
 
 const count = (text, re) => (text.match(re) ?? []).length;
+const SHELLS = new Set(["fish", "zsh", "bash", "sh", "dash", "ksh"]);
+const sleep = (s) => exec("sleep", [String(s)]);
+async function terminal(addr) { return JSON.parse((await hc(["get", addr, "--json"])).stdout); }
+// The shell at the prompt, not a `fish -lic '...'` wrapper still running a command.
+const atPrompt = (fg) => SHELLS.has((fg?.argv?.[0] ?? "").split("/").pop()) && !fg.argv.slice(1).some((a) => /^-\w*c/.test(a));
 
 export default class ClaudePicker extends View {
   init(_props, cx) {
@@ -34,6 +40,8 @@ export default class ClaudePicker extends View {
         const argv = labels?.["claude.account"] ? undefined : await foregroundArgv(addr);
         Object.assign(this, stateOf(this.cfg, labels, argv));
         this.applied = { model: this.model, effort: this.effort };
+        this.started = account(this.cfg, this.account)?.id;
+        this.account = this.started;
       } else {
         const last = shared(LAST) ?? {};
         this.account = account(this.cfg, last.account)?.id;
@@ -45,6 +53,61 @@ export default class ClaudePicker extends View {
   }
 
   live() { return Boolean(props()?.terminal); }
+
+  status() { return panes().find((p) => p.terminal === props()?.terminal)?.status ?? null; }
+
+  // Live: the account can change only while Claude waits for a prompt (/exit is typed into it).
+  canPickAccount() { return !this.live() || (!this.switching && !["working", "blocked"].includes(this.status())); }
+
+  switchPending() { return this.live() && this.account !== this.started; }
+
+  pickAccount(id, cx) {
+    if (!this.canPickAccount()) return;
+    this.account = id;
+    cx.notify();
+  }
+
+  confirm(cx) {
+    if (!this.live()) return this.start();
+    if (!this.switchPending()) return this.dismiss();
+    if (this.switching) return;
+    this.switching = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        await this.queue;
+        await this.switchAccount();
+        this.dismiss();
+      } catch (e) {
+        this.switching = false;
+        notify({ title: "Couldn't switch account", body: String(e?.message ?? e), level: "error" });
+        cx.notify();
+      }
+    });
+  }
+
+  // /exit the running Claude, wait for the tab's shell, then reopen the session in the new account.
+  async switchAccount() {
+    const addr = props()?.terminal;
+    const t0 = await terminal(addr);
+    const session = t0.foreground?.pid && (await sessionAt(this.cfg, t0.foreground.pid));
+    if (!session) throw new Error("Couldn't find the Claude session running in this tab.");
+    const alive = async () => (await exec("kill", ["-0", String(session.pid)])).code === 0;
+    const r = await hc(["send", addr, "/exit"]);
+    if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+    for (let i = 0; ; i++) {
+      if (i === 60) throw new Error("Claude didn't exit within 15s.");
+      await sleep(0.25);
+      const t = await terminal(addr);
+      if (t.state !== "live") throw new Error("The tab closed when Claude exited.");
+      if (!(await alive()) && atPrompt(t.foreground)) break;
+    }
+    await sleep(0.3); // let the shell draw its prompt
+    const choice = { account: this.account, model: this.model, effort: this.effort };
+    await hc(["label", addr, ...labelArgs(this.cfg, choice)]);
+    const s = await hc(["send", addr, resumeLine(this.cfg, choice, session.sessionId)]);
+    if (s.code !== 0) throw new Error((s.stderr || s.stdout).trim());
+  }
 
   // Not `close`: Herdr calls a View's close(cx) itself when the overlay goes.
   dismiss() { closeOverlay(props()?.overlay); }
@@ -112,15 +175,16 @@ export default class ClaudePicker extends View {
 
   accountRow(t, a, i) {
     const on = a.id === this.account;
-    const fixed = this.live();
+    const fixed = !this.canPickAccount();
     return h_flex().id(`acct-${a.id}`).h(40).px(10).gap(10).items_center().rounded(7).border_1()
       .border_color(on ? t.accent : t.border).when(on, (el) => el.bg(t.selected))
       .when(!fixed && !on, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)))
-      .on_click((_e, cx) => { if (!fixed) { this.account = a.id; cx.notify(); } })
+      .on_click((_e, cx) => this.pickAccount(a.id, cx))
       .child(div().size(10).flex_none().rounded(5).border_1().border_color(on ? t.accent : t.dim).when(on, (el) => el.bg(t.accent)))
       .child(v_flex().flex_1().min_w(0)
         .child(div().text_color(t.foreground).font_medium().child(a.name))
         .child(div().text_size(11).text_color(t.dim).truncate().child(a.detail ?? "")))
+      .when(this.live() && a.id === this.started, (el) => el.child(div().text_size(11).text_color(t.dim).child("running")))
       .when(!fixed && i < 9, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(i + 1))));
   }
 
@@ -130,18 +194,20 @@ export default class ClaudePicker extends View {
       .child(this.error ? `Couldn't read accounts.json: ${this.error}` : "Loading…");
     const { accounts: ACCOUNTS, models: MODELS, efforts: EFFORTS } = this.cfg;
     const live = this.live();
-    const status = live ? panes().find((p) => p.terminal === props()?.terminal)?.status : null;
-    const accounts = live ? [account(this.cfg, this.account)] : ACCOUNTS;
+    const status = live ? this.status() : null;
+    const pending = this.switchPending();
+    const accountNote = !live ? "" : this.switching ? "restarting Claude…" : !this.canPickAccount() ? "switch when this turn ends"
+      : pending ? "restarts Claude here, same conversation" : "switching restarts Claude";
     return v_flex().id("claude-picker").track_focus(this.handle).w_full().p(16).gap(8).bg(t.popover).text_size(12.5)
       .on_key_down((e, cx) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
         const k = e.key;
-        if (k === "enter") return live ? this.dismiss() : this.start();
+        if (k === "enter") return this.confirm(cx);
         if (k === "escape") return this.dismiss();
-        if (!live && /^[1-9]$/.test(k) && ACCOUNTS[Number(k) - 1]) this.account = ACCOUNTS[Number(k) - 1].id;
-        else if (!live && (k === "up" || k === "down")) {
+        if (/^[1-9]$/.test(k) && ACCOUNTS[Number(k) - 1]) this.pickAccount(ACCOUNTS[Number(k) - 1].id, cx);
+        else if (k === "up" || k === "down") {
           const i = ACCOUNTS.findIndex((a) => a.id === this.account);
-          this.account = ACCOUNTS[(i + (k === "down" ? 1 : ACCOUNTS.length - 1)) % ACCOUNTS.length].id;
+          this.pickAccount(ACCOUNTS[(i + (k === "down" ? 1 : ACCOUNTS.length - 1)) % ACCOUNTS.length].id, cx);
         } else if (k === "left" || k === "right") {
           const by = k === "right" ? 1 : -1;
           if (e.modifiers.shift) this.step("effort", EFFORTS, by, cx); else this.step("model", MODELS, by, cx);
@@ -150,8 +216,8 @@ export default class ClaudePicker extends View {
         cx.notify();
       })
       .child(div().text_size(14).font_semibold().text_color(t.foreground).child(live ? "Claude in this tab" : "New Claude tab"))
-      .child(this.heading(t, "Account", live ? "fixed for this session" : ""))
-      .child(v_flex().gap(6).children(accounts.map((a, i) => this.accountRow(t, a, i))))
+      .child(this.heading(t, "Account", accountNote))
+      .child(v_flex().gap(6).children(ACCOUNTS.map((a, i) => this.accountRow(t, a, i))))
       .child(this.heading(t, "Model", live && status === "working" ? "applies after this turn" : ""))
       .child(h_flex().flex_wrap().gap(6).children(MODELS.map((m) =>
         this.chip(t, `model-${m.value || "default"}`, m.name, m.value === this.model, (cx) => this.pick("model", m.value, cx)))))
@@ -164,6 +230,6 @@ export default class ClaudePicker extends View {
           .child(div().id("cancel").h(28).px(12).flex().items_center().rounded(6).cursor_pointer().text_color(t.muted)
             .hover((s) => s.bg(t.hover)).on_click(() => this.dismiss()).child("Cancel")))
         .child(div().id("go").h(28).px(14).flex().items_center().rounded(6).cursor_pointer().bg(t.solid).text_color(t.solid_foreground).font_medium()
-          .on_click(() => (live ? this.dismiss() : this.start())).child(live ? "Done" : "Start  ↵")));
+          .on_click((_e, cx) => this.confirm(cx)).child(!live ? "Start  ↵" : this.switching ? "Restarting…" : pending ? "Switch account  ↵" : "Done")));
   }
 }

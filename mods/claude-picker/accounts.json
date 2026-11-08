@@ -2,15 +2,18 @@
   "notes": [
     "The Claude accounts, models and efforts the picker offers (read by claude-picker and my-pane).",
     "An account is the environment Claude starts with: `unset` removes variables (fish exports ANTHROPIC_API_KEY, which wins over a login), `env` sets them (\"~/\" is that machine's home).",
+    "Since 2026-11-08 ~/.claude/settings.json sets ANTHROPIC_BASE_URL to the CLIProxyAPI pool, so every account's Claude goes through it; the account rows only pick the config folder.",
+    "`command` replaces `claude` (e.g. a wrapper that sets up a proxy); flags still follow it.",
     "A separate login lives in its own CLAUDE_CONFIG_DIR. ~/.claude-personal links settings, skills, plugins, rules and projects to ~/.claude, so only the login differs.",
     "`plain`: what a `claude` started outside the picker runs as. Model/effort value \"\" = Claude's default (no flag; /model default, /effort auto live)."
   ],
   "accounts": [
     { "id": "merkl", "name": "Merkl", "detail": "work subscription · ~/.claude", "unset": ["ANTHROPIC_API_KEY"] },
     { "id": "personal", "name": "Personal", "detail": "subscription · ~/.claude-personal", "unset": ["ANTHROPIC_API_KEY"], "env": { "CLAUDE_CONFIG_DIR": "~/.claude-personal" } },
-    { "id": "api", "name": "API key", "detail": "ANTHROPIC_API_KEY · usage billing" }
+    { "id": "api", "name": "API key", "detail": "ANTHROPIC_API_KEY · usage billing" },
+    { "id": "pool", "name": "Proxy pool", "detail": "CLIProxyAPI on 127.0.0.1:8317 · Personal first, then the next", "command": ["claude-proxy"] }
   ],
-  "plain": "api",
+  "plain": "pool",
   "models": [
     { "value": "", "name": "Default" },
     { "value": "fable", "name": "Fable" },
