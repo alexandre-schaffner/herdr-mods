@@ -7,8 +7,16 @@ import { kindOf } from "./media-kinds.js";
 
 export const viewable = path => typeof path === "string" && path.startsWith("/") && kindOf(path) !== null;
 
-/** Opens `file` in the system's default app (`files` is accepted and ignored). */
+// A mod that shows files itself (HQ's file viewer) registers here; it returns true when it took
+// the file. Each mod has its own copy of this module, so a host only sees its own mod's links.
+let host = null;
+export function setViewerHost(fn) {
+  host = fn;
+}
+
+/** Opens `file`: in the host's viewer when it takes it, else the system's default app (`files` is accepted and ignored). */
 export function openViewer(file, _files) {
+  if (host?.(file)) return;
   exec("open", [file]).catch(() => exec("xdg-open", [file]).catch(() => {}));
 }
 

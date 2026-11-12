@@ -34,6 +34,39 @@ PENDING_MAX_S = 3 * 3600
 RESUMED_SLACK_S = 5
 
 
+# Runs the person archived: kept on disk (transcripts are Claude Code's), hidden from the list.
+ARCHIVE = os.path.join(claude.APP_HOME, "data", "workflows", "archived.json")
+
+
+def archived():
+    a = read_json(ARCHIVE)
+    return a if isinstance(a, dict) else {}
+
+
+def _set_archived(run_id, on):
+    if run_id not in run_dirs():
+        return {"error": "no such run: " + run_id}
+    a = archived()
+    if on:
+        a[run_id] = int(time.time() * 1000)
+    else:
+        a.pop(run_id, None)
+    os.makedirs(os.path.dirname(ARCHIVE), exist_ok=True)
+    tmp = f"{ARCHIVE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(a, f, indent=1)
+    os.replace(tmp, ARCHIVE)
+    return {"ok": True, "id": run_id, "archived": bool(on)}
+
+
+def cmd_archive(run_id):
+    return _set_archived(run_id, True)
+
+
+def cmd_unarchive(run_id):
+    return _set_archived(run_id, False)
+
+
 def run_dirs():
     out = {}
     for d in glob.glob(os.path.join(ROOT, "*", "*", "subagents", "workflows", "wf_*")):
@@ -401,6 +434,7 @@ def summarize(run_id, run_dir, with_agents=False):
 
 def cmd_list(here=None):
     runs = []
+    shelf = archived()
     for run_id, d in run_dirs().items():
         try:
             r = summarize(run_id, d)
@@ -409,6 +443,8 @@ def cmd_list(here=None):
         except Exception as e:  # one unreadable run must not hide the others
             runs.append({"id": run_id, "name": run_id, "status": "unreadable", "error": str(e),
                          "startedAt": int(newest_mtime(d) * 1000), "phases": [], "agents": 0})
+    for r in runs:
+        r["archivedAt"] = shelf.get(r["id"])
     runs.sort(key=lambda r: (r["status"] == "running", r.get("endedAt") or r.get("startedAt") or 0), reverse=True)
     return {"now": int(time.time() * 1000), "runs": runs, "here": repo_of(here) if here else None}
 

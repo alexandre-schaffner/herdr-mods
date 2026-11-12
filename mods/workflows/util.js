@@ -6,6 +6,18 @@ import { ok } from "./shared/look.js";
 
 export { alpha, ICON, icon, mix, mono, ok } from "./shared/look.js";
 
+/** Where this copy of the view runs: the Workflows panel, or embedded in HQ's Workflows
+ *  section (HQ mounts a mirror of this mod, mods/hq/wf, made by shared/sync.sh). Embedded, it
+ *  keeps its saved state under its own prefix in HQ's storage, leaves HQ's commands alone,
+ *  and steps out of HQ (`leave`) before it focuses a terminal. */
+export const host = { embedded: false, prefix: "", leave: () => {}, typing: () => false };
+
+/** This view's saved state (localStorage, under the host's prefix). */
+export const store = {
+  get: key => localStorage.getItem(host.prefix + key),
+  set: (key, value) => localStorage.setItem(host.prefix + key, value),
+};
+
 // A session's or node's state, as one of five looks.
 export function look(state, t) {
   switch (state) {
@@ -22,7 +34,8 @@ export function look(state, t) {
     case "killed":
       return { key: "killed", color: t.muted, label: "Killed", glyph: "square" };
     case "stalled":
-      return { key: "stalled", color: t.idle ?? t.muted, label: "Stalled", glyph: "clock" };
+      // A warning, as HQ shows it: something needs a look, nothing has failed.
+      return { key: "stalled", color: t.ansi3 ?? t.working, label: "Stalled", glyph: "clock" };
     default:
       return { key: "queued", color: t.dim, label: "Queued", glyph: "clock" };
   }

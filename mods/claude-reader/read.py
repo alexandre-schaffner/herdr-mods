@@ -1,34 +1,59 @@
 """Claude Code transcript → compact events, read incrementally.
 
-  python3 -I read.py --pid <pid> --cwd <dir> [--path <jsonl>] [--offset <bytes>]
+  python3 -I read.py --pid <pid> --cwd <dir> [--path <jsonl>] [--offset <bytes>] [--resolve]
 
-Finds the session a terminal runs (`pid`: its shell or claude itself; the claude under it,
+With --resolve (or without a --path that exists), finds the session a terminal runs (`pid`: its shell or claude itself; the claude under it,
 named by any account's sessions/<pid>.json or else its `--session-id`/`--resume` argument →
 projects/<slug>/<sessionId>.jsonl, else the folder's newest transcript no running claude owns),
 parses the lines after `offset` and prints one JSON object: the events, the new offset
-and session facts. Only complete lines are consumed, so a line being written is read
-on the next call. Big tool outputs are clipped; on a huge first read the oldest events
-are dropped to keep the output small.
+and session facts. Finding the session reads the whole process table, so a caller that
+already knows the path resolves it only now and then (a /clear starts a new transcript).
+Only complete lines are consumed, so a line being written is read on the next call. Big
+tool outputs are clipped. A first read takes the transcript from its end, backward, until
+its events fill the budget: a long session's transcript runs to hundreds of MB, and is
+never parsed or held whole (`truncated`: older lines weren't read).
 """
 
-import argparse
 import json
 import os
 import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "shared"))
-from claude import ANSI, PROJECTS, claimed_sessions, find_transcript, save_image, session_of, slug  # noqa: E402
+from claude import ANSI, PROJECTS, claimed_sessions, find_transcript, keep_image, save_image, session_of, slug  # noqa: E402
 
-OUT_BUDGET = 5_500_000
+OUT_BUDGET = 1_200_000  # what a chat loads at once; the mods' script memory is small and shared
 RESULT_HEAD, RESULT_TAIL = 2600, 900
+TAIL_STEP = 2 << 20  # a first read's first chunk from the end; each next one doubles
 
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+PASTED = re.compile(r"</?pasted_content[^>]*>")
+# Claude Code's stand-ins for an attached picture: "[Image #N]" where it sat, "[Image: source: <path>]" after it
+IMAGE_MARK = re.compile(r"\[Image #\d+\]\s*|\[Image: source: [^\]\n]*\]\s*")
+# A picture named by its absolute path (a message HQ sent, a file dropped on a terminal): quoted,
+# or bare with its spaces escaped. Claude Code doesn't always turn these into images.
+_EXT = r"\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp)"
+IMAGE_PATH = re.compile(r'"((?:/|~/)[^"\n]*?%s)"|\'((?:/|~/)[^\'\n]*?%s)\'|(?<!\S)((?:/|~/)(?:\\ |[^\s"\'])+?%s)(?!\S)' % (_EXT, _EXT, _EXT), re.I)
+
+
+def said(raw):
+    """A user message's words, and the pictures it names by path (kept, or None once gone)."""
+    named = []
+
+    def take(m):
+        p = m.group(1) or m.group(2) or m.group(3).replace("\\ ", " ")
+        named.append(keep_image(p))
+        return "\0"
+
+    text = IMAGE_PATH.sub(take, IMAGE_MARK.sub("", PASTED.sub("", REMINDER.sub("", raw))))
+    return re.sub(r"[ \t]*\0[ \t]*", " ", text).strip(), named
 TAG = lambda name: re.compile(r"<%s>(.*?)</%s>" % (name, name), re.S)
 CMD_NAME, CMD_ARGS = TAG("command-name"), TAG("command-args")
 LOCAL_OUT = TAG("local-command-stdout")
 BASH_IN, BASH_OUT, BASH_ERR = TAG("bash-input"), TAG("bash-stdout"), TAG("bash-stderr")
 SUMMARY, STATUS = TAG("summary"), TAG("status")
+TOOL_ID = TAG("tool-use-id")
+HANDBACK = re.compile(r'<agent-message from="([^"]+)">\s*\[Subagent hand-back\][^\n]*\n(?:.*?The report follows:\n)?(.*?)(?:</agent-message>|$)', re.S)
 def newest(folder):
     """The folder's newest transcript that no running claude owns: a terminal whose session
     can't be named (claude exited) may show its last one, never another live session's."""
@@ -40,7 +65,9 @@ def newest(folder):
     return max(files, key=os.path.getmtime) if files else None
 
 
-def resolve(pid, cwd, given):
+def resolve(pid, cwd, given, again):
+    if given and not again and os.path.exists(given):
+        return given, None
     s = session_of([int(pid)]) if str(pid).isdigit() else None
     if s:
         # A known session with no transcript yet shows nothing rather than a neighbour's.
@@ -123,12 +150,18 @@ def user_events(o, ev):
             texts.append(b.get("text", ""))
         elif t == "image":
             images.append(save_image(b))
-    if o.get("isMeta"):
-        return
     raw = "\n".join(texts)
+    if o.get("isMeta"):
+        # A background agent's final report, handed back as a hidden message: it starts the turn
+        # that answers it (see task_note).
+        m = HANDBACK.search(raw)
+        if m:
+            report = "\n".join(l[2:] if l.startswith("  ") else l for l in m.group(2).strip().split("\n"))
+            ev.append({"k": "note", "id": uid, "ts": ts, "kind": "task", "text": "A background agent reported back", "agent": m.group(1),
+                       "report": clip(report, 6000, 1500)})
+        return
     if not raw.strip() and not images:
         return
-    text = REMINDER.sub("", raw).strip()
     if "<local-command-caveat>" in raw:
         return
     m = CMD_NAME.search(raw)
@@ -151,16 +184,24 @@ def user_events(o, ev):
         ev.append({"k": "bashout", "id": uid, "ts": ts, "out": clip(out.group(1) if out else ""), "err": clip(err.group(1) if err else "")})
         return
     if raw.lstrip().startswith("<task-notification>"):
-        s, st = SUMMARY.search(raw), STATUS.search(raw)
-        label = (s.group(1) if s else "Background task update").strip()
-        ev.append({"k": "note", "id": uid, "ts": ts, "kind": "task", "text": label, "status": (st.group(1).strip() if st else "")})
+        ev.append(task_note(raw, uid, ts))
         return
+    # A long paste arrives wrapped in <pasted_content>: the words are what was said.
+    text, named = said(raw)
+    images += named
     if text.startswith("[Request interrupted by user"):
         ev.append({"k": "note", "id": uid, "ts": ts, "kind": "interrupt", "text": "Interrupted"})
         return
     if not text and not images:
         return
     ev.append({"k": "user", "id": uid, "ts": ts, "text": text, "images": len(images), "files": [f for f in images if f]})
+
+
+def task_note(raw, uid, ts):
+    """Background work reporting back: what finished, and the tool call that started it."""
+    s, st, tid = SUMMARY.search(raw), STATUS.search(raw), TOOL_ID.search(raw)
+    return {"k": "note", "id": uid, "ts": ts, "kind": "task", "text": (s.group(1) if s else "Background task update").strip(),
+            "status": (st.group(1).strip() if st else ""), "tool": (tid.group(1).strip() if tid else None)}
 
 
 def assistant_events(o, ev, meta):
@@ -225,12 +266,17 @@ def parse(line, ev, meta):
         meta.setdefault("summary", o.get("summary"))
     elif t == "attachment":
         a = o.get("attachment") or {}
-        if a.get("type") == "queued_command" and (a.get("origin") or {}).get("kind", "human") == "human":
+        kind = (a.get("origin") or {}).get("kind", "human")
+        if a.get("type") == "queued_command" and kind == "task-notification" and isinstance(a.get("prompt"), str):
+            ev.append(task_note(a["prompt"], o.get("uuid"), o.get("timestamp") or a.get("timestamp")))
+        elif a.get("type") == "queued_command" and kind == "human":
             text = a.get("prompt")
             if isinstance(text, list):
                 text = block_text(text)[0]
             if text:
-                ev.append({"k": "user", "id": o.get("uuid"), "ts": o.get("timestamp") or a.get("timestamp"), "text": REMINDER.sub("", text).strip(), "queued": True})
+                words, named = said(text)
+                ev.append({"k": "user", "id": o.get("uuid"), "ts": o.get("timestamp") or a.get("timestamp"), "text": words, "queued": True,
+                           "images": len(named), "files": [f for f in named if f]})
     elif t == "system":
         st = o.get("subtype")
         uid, ts = o.get("uuid"), o.get("timestamp")
@@ -248,32 +294,85 @@ def parse(line, ev, meta):
                 ev.append({"k": "note", "id": uid, "ts": ts, "kind": "error", "text": str(text)})
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pid", default="")
-    ap.add_argument("--cwd", default="")
-    ap.add_argument("--path", default="")
-    ap.add_argument("--offset", type=int, default=0)
-    a = ap.parse_args()
+def parse_lines(data, meta):
+    ev = []
+    for raw in data.split(b"\n"):
+        if raw:
+            parse(raw.decode("utf-8", "replace"), ev, meta)
+    return ev
 
-    path, session = resolve(a.pid, a.cwd, a.path)
-    out = {"path": path, "session": (session or {}).get("sessionId"), "name": (session or {}).get("name"), "events": [], "meta": {}}
+
+def read_tail(f, size):
+    """A first read: the newest complete lines whose events fill the budget, read backward in
+    chunks that double. → (events, meta, end offset, whether it reached the start)."""
+    hi = lo = size
+    step, end, carry = TAIL_STEP, None, b""
+    parts, meta, est = [], {}, 0
+    while lo > 0 and est < OUT_BUDGET:
+        lo = max(0, lo - step)
+        step *= 2
+        f.seek(lo)
+        data = f.read(hi - lo) + carry
+        hi, carry = lo, b""
+        if end is None:
+            cut = data.rfind(b"\n") + 1
+            if not cut:
+                continue  # all of it is a last line still being written
+            end, data = lo + cut, data[:cut]
+        if lo > 0:
+            # The chunk starts inside a line: that part goes with the chunk before it.
+            nl = data.find(b"\n") + 1
+            carry, data = data[:nl], data[nl:]
+        older = {}
+        ev = parse_lines(data, older)
+        parts.append(ev)
+        est += sum(len(json.dumps(e)) for e in ev)
+        for k, v in older.items():
+            if k == "summary" or k not in meta:  # the newest wins, but the summary is the first one
+                meta[k] = v
+    return [e for ev in reversed(parts) for e in ev], meta, end or 0, lo == 0
+
+
+def args(argv):
+    """The flags (see the top). Not argparse: this runs every second or so while a chat shows,
+    and argparse is a third of its start-up."""
+    a = {"pid": "", "cwd": "", "path": "", "offset": 0, "resolve": False}
+    it = iter(argv)
+    for k in it:
+        name = k[2:]
+        if name == "resolve":
+            a["resolve"] = True
+        elif name in a:
+            v = next(it, "")
+            a[name] = int(v or 0) if name == "offset" else v
+    return a
+
+
+def main():
+    a = args(sys.argv[1:])
+    path, session = resolve(a["pid"], a["cwd"], a["path"], a["resolve"])
+    s = session or {}
+    # config: the account the session runs under (its models, see models.py).
+    out = {"path": path, "session": s.get("sessionId"), "name": s.get("name"), "config": s.get("configDir"), "events": [], "meta": {}}
     if not path:
         out["error"] = "no-transcript"
         print(json.dumps(out))
         return
     size = os.path.getsize(path)
-    offset = a.offset if (path == a.path and 0 <= a.offset <= size) else 0
+    offset = a["offset"] if (path == a["path"] and 0 <= a["offset"] <= size) else 0
     out["reset"] = offset == 0
-    ev, meta = [], {}
     with open(path, "rb") as f:
-        f.seek(offset)
-        data = f.read()
-    end = data.rfind(b"\n") + 1
-    for raw in data[:end].split(b"\n"):
-        if raw:
-            parse(raw.decode("utf-8", "replace"), ev, meta)
-    out["offset"] = offset + end
+        if offset == 0:
+            ev, meta, end, whole = read_tail(f, size)
+            out["truncated"] = not whole
+        else:
+            f.seek(offset)
+            data = f.read()
+            cut = data.rfind(b"\n") + 1
+            meta = {}
+            ev = parse_lines(data[:cut], meta)
+            end = offset + cut
+    out["offset"] = end
     out["size"] = size
     out["meta"] = meta
 

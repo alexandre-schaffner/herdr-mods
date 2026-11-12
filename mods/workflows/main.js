@@ -8,19 +8,19 @@ import { closeOverlay, exec, home, layout, nextCommand, notify, panes, props, re
 import { DRAWER_W, drawer, sessionBody } from "./drawer.js";
 import { WorkflowEditor } from "./editor.js";
 import { generate, pickAgent, poll } from "./editor/ai.js";
-import { graph } from "./graph.js";
+import { dirSwitch, graph } from "./graph.js";
 import { runHeader, runStrip, topBar } from "./header.js";
 import { collect } from "./io.js";
 import { library } from "./library.js";
 import { hasOutput, outputView } from "./output.js";
-import { hereCwd, repoPanelView, shownRepo, visibleRuns } from "./repos.js";
+import { hereCwd, repoPanelView, repoRuns, shownRepo, visibleRuns } from "./repos.js";
 import { armResume, confirmResume, goToOwner } from "./resume.js";
 import { buildGraph, isLive } from "./runs.js";
 import { openLink, openViewer, stage, viewable } from "./shared/viewer-link.js";
 import { openSessionWindow, sessionBar, shellText, terminalsView } from "./terminals.js";
 import { blankModel, designOf } from "./model.js";
 import { btn, seg as segmented } from "./ui.js";
-import { scrollArea, alpha, icon, look, mix, mono } from "./util.js";
+import { scrollArea, alpha, host, icon, look, mix, mono, store } from "./util.js";
 
 /** A saved script as the editor opens it: its design, or its code, with the design it
  * strayed from when it was edited by hand. */
@@ -64,13 +64,24 @@ function showTab() {
 }
 
 export default class Workflows extends View {
-  init(_props, cx) {
+  init(initProps, cx) {
+    // Mounted by HQ (cx.new(Workflows, {embedded: true, ...})): see `host` in util.js.
+    if (initProps?.embedded) {
+      host.embedded = true;
+      host.prefix = "wf.";
+      host.leave = initProps.leave ?? (() => {});
+      host.typing = () => this.view === "library" && this.editor.isOpen();
+      // The host lists the runs itself (HQ's left column) and switches views through this.
+      host.app = this;
+      this.embedded = true;
+      this.update(initProps);
+    }
     // The title bar of a session's terminal window (terminals.js opens it).
-    if (props()?.part === "session-bar") {
+    if (!this.embedded && props()?.part === "session-bar") {
       this.bar = props();
       return;
     }
-    const overlay = props()?.overlay;
+    const overlay = this.embedded ? null : props()?.overlay;
     if (overlay) {
       this.launcher = true;
       cx.spawn(async () => {
@@ -80,9 +91,10 @@ export default class Workflows extends View {
       return;
     }
     this.runs = null;
-    this.runId = localStorage.getItem("run");
+    this.showArchived = store.get("showArchived") === "1";
+    this.runId = store.get("run");
     this.run = null;
-    const sel = JSON.parse(localStorage.getItem("selection") ?? "{}");
+    const sel = JSON.parse(store.get("selection") ?? "{}");
     this.nodeId = sel.run === this.runId ? (sel.node ?? null) : null;
     this.session = sel.run === this.runId ? (sel.session ?? null) : null;
     this.tab = "transcript";
@@ -91,7 +103,7 @@ export default class Workflows extends View {
     this.tick = 0;
     this.busy = {};
     this.queued = {};
-    this.view = localStorage.getItem("view") ?? "runs";
+    this.view = store.get("view") ?? "runs";
     this.editor = new WorkflowEditor();
     this.lib = { workflows: null, roots: [], loading: false, error: null, confirmDelete: null };
     this.tx = { expanded: new Set(), filter: "all", latestFirst: false };
@@ -105,7 +117,10 @@ export default class Workflows extends View {
     // Terminals: the agent picked per run, its shell, the owning session's terminal.
     this.term = { agentByRun: {}, shell: null, session: null, filter: "shell", follow: true, width: null, stick: false, lines: [] };
     this.termHandle = VirtualListScrollHandle.new();
-    cx.timer.every(300, cx => this.pumpThumbs(cx));
+    cx.timer.every(300, cx => {
+      this.takeSelect(cx);
+      this.pumpThumbs(cx);
+    });
     this.refreshList(cx);
     if (this.view === "library") this.refreshLibrary(cx);
     cx.spawn(async cx => {
@@ -118,7 +133,8 @@ export default class Workflows extends View {
       cx.notify();
     });
     cx.timer.every(POLL_MS, cx => this.poll(cx));
-    cx.spawn(async cx => {
+    // Key commands (workflows.save, ...). Embedded, the commands are HQ's: don't take them.
+    if (!this.embedded) cx.spawn(async cx => {
       for (;;) {
         const c = await nextCommand();
         if (c === "save" && this.editor.isOpen() && !this.editor.hero) this.editor.save(cx);
@@ -140,7 +156,7 @@ export default class Workflows extends View {
 
   setView(view, cx) {
     this.view = view;
-    localStorage.setItem("view", view);
+    store.set("view", view);
     if (view === "library" && !this.lib.workflows) this.refreshLibrary(cx);
     cx.notify();
   }
@@ -296,8 +312,43 @@ export default class Workflows extends View {
     };
   }
 
+  /** Embedded: HQ's props. `select` {run, at} shows a run; `active` false while HQ shows
+   *  another section, which pauses the polling. */
+  update(p) {
+    if (!p) return;
+    if (p.select) this.asked = p.select;
+    if (p.ask) this.askedDo = p.ask; // {do: "library" | "archived", at}
+    this.paused = p.active === false;
+  }
+
+  /** A run HQ asked to show (its `select` prop), once. */
+  takeSelect(cx) {
+    const todo = this.askedDo;
+    if (todo?.at > (this.doSeen ?? 0)) {
+      this.doSeen = todo.at;
+      if (todo.do === "library") this.setView("library", cx);
+      if (todo.do === "archived") this.toggleArchived(cx);
+      cx.notify();
+    }
+    const ask = this.asked;
+    if (!ask?.run || !(ask.at > (this.selectSeen ?? 0))) return;
+    this.selectSeen = ask.at;
+    if (this.view !== "runs") this.setView("runs", cx);
+    const known = (this.runs ?? []).find(r => r.id === ask.run);
+    if (known) {
+      this.pinned = known.repo?.key && known.repo.key !== this.here?.key ? known.repo.key : null;
+      this.selectRun(known.id, cx);
+    } else {
+      this.wantRun = ask.run;
+      this.refreshList(cx);
+    }
+    cx.notify();
+  }
+
   poll(cx) {
+    if (this.paused) return;
     this.tick += 1;
+    this.takeSelect(cx);
     const live = isLive(this.run?.status);
     if (live) {
       this.refreshRun(cx);
@@ -347,8 +398,16 @@ export default class Workflows extends View {
       this.runs = runs;
       this.listedFor = cwd;
       if (here) this.here = here;
+      // Asked to show a run not listed yet (takeSelect): show its repository too, as picking it would.
+      const want = this.wantRun && runs.find(r => r.id === this.wantRun);
+      this.wantRun = null;
+      if (want) {
+        this.pinned = want.repo?.key && want.repo.key !== this.here?.key ? want.repo.key : null;
+        if (this.runId !== want.id) this.selectRun(want.id, cx);
+      }
       const visible = visibleRuns(this);
-      if (!this.runId || !visible.some(r => r.id === this.runId)) {
+      // Embedded, the host picks the run, and may pick one outside the shown repository.
+      if (!this.runId || !(this.embedded ? runs : visible).some(r => r.id === this.runId)) {
         const pick = visible.find(r => isLive(r.status)) ?? visible[0];
         if (pick) this.selectRun(pick.id, cx);
       } else if (!this.run) {
@@ -574,6 +633,38 @@ export default class Workflows extends View {
     };
   }
 
+  /** Archives a run (hidden from the strip, nothing deleted) or brings it back. Archiving the
+   *  shown run moves on to the next one, unless archived runs are on show. */
+  archiveRun(id, on, cx) {
+    cx.spawn(async cx => {
+      try {
+        await collect([on ? "archive" : "unarchive", id]);
+        const r = (this.runs ?? []).find(x => x.id === id);
+        if (r) r.archivedAt = on ? Date.now() : null;
+        if (on && this.runId === id && !this.showArchived) {
+          const rest = visibleRuns(this);
+          const next = rest.find(x => isLive(x.status)) ?? rest[0];
+          if (next) this.selectRun(next.id, cx);
+          else Object.assign(this, { runId: null, run: null, nodeId: null, session: null, transcript: null });
+        }
+      } catch (e) {
+        notify({ title: on ? "Couldn't archive the run" : "Couldn't unarchive the run", body: String(e?.message ?? e), level: "error" });
+      }
+      this.refreshList(cx);
+      cx.notify();
+    });
+  }
+
+  toggleArchived(cx) {
+    this.showArchived = !this.showArchived;
+    store.set("showArchived", this.showArchived ? "1" : "0");
+    if (!this.showArchived && this.runId && !visibleRuns(this).some(r => r.id === this.runId)) {
+      const next = visibleRuns(this)[0];
+      if (next) this.selectRun(next.id, cx);
+    }
+    cx.notify();
+  }
+
   selectRun(id, cx) {
     if (this.runId !== id) {
       this.run = null;
@@ -583,7 +674,7 @@ export default class Workflows extends View {
       this.reader = false;
     }
     this.runId = id;
-    localStorage.setItem("run", id);
+    store.set("run", id);
     this.refreshRun(cx);
     cx.notify();
   }
@@ -613,7 +704,7 @@ export default class Workflows extends View {
   }
 
   remember() {
-    localStorage.setItem("selection", JSON.stringify({ run: this.runId, node: this.nodeId, session: this.session }));
+    store.set("selection", JSON.stringify({ run: this.runId, node: this.nodeId, session: this.session }));
   }
 
   pickedSession() {
@@ -716,9 +807,11 @@ export default class Workflows extends View {
       main = this.empty(
         t,
         shownRepo(this) ? `No workflow runs in ${shownRepo(this).name}` : "No workflow runs yet",
-        (this.runs ?? []).length
-          ? "Runs from your other repositories are one click away in the repository menu on the left."
-          : "Runs appear when a Claude Code session starts a dynamic workflow.",
+        repoRuns(this).length
+          ? `All ${repoRuns(this).length} runs here are archived. ${this.embedded ? "Show archived runs from the list." : "Click Archived in the runs strip to see them."}`
+          : (this.runs ?? []).length
+            ? "Runs from your other repositories are one click away in the repository menu on the left."
+            : "Runs appear when a Claude Code session starts a dynamic workflow.",
       );
     else if (!this.run || !lanes) main = this.empty(t, "Loading run…", null, true);
     else
@@ -755,19 +848,28 @@ export default class Workflows extends View {
               ),
             ))
             .when((!this.reader || !this.pickedSession()) && tab === "graph", el => el.child(
-              scrollArea(
-                "graph-scroll",
-                "both",
-                div()
-                  .border_t(1)
-                  .border_color(alpha(t.border, 0.6))
-                  .bg(t.canvas ?? mix(t.background, t.foreground, 0.02))
-                  .child(
-                    lanes.some(l => l.nodes.length)
-                      ? graph(lanes, t, this.nodeId, (id, cx) => this.selectNode(id, cx))
-                      : this.empty(t, "Waiting for the first agent…", null, isLive(this.run.status)),
+              v_flex()
+                .relative()
+                .flex_1()
+                .min_h(0)
+                .min_w(0)
+                .child(
+                  scrollArea(
+                    "graph-scroll",
+                    "both",
+                    div()
+                      .border_t(1)
+                      .border_color(alpha(t.border, 0.6))
+                      .bg(t.canvas ?? mix(t.background, t.foreground, 0.02))
+                      .child(
+                        lanes.some(l => l.nodes.length)
+                          ? graph(lanes, t, this.nodeId, (id, cx) => this.selectNode(id, cx), { compact: true })
+                          : this.empty(t, "Waiting for the first agent…", null, isLive(this.run.status)),
+                      ),
                   ),
-              ),
+                )
+                // The direction is a viewing preference: it sits on the canvas, not in the header.
+                .child(div().absolute().top(10).right(14).child(dirSwitch(t, "run-dir"))),
             )),
         )
         .child(
@@ -818,8 +920,9 @@ export default class Workflows extends View {
       .overflow_hidden()
       .bg(t.background)
       .text_color(t.foreground)
-      .child(topBar(this, t, live))
-      .when(this.view === "runs" && this.runs !== null, el => el.child(runStrip(this, t, runs, now)))
+      // Embedded, the host has its own title and lists the runs: no top bar, no strip.
+      .when(!this.embedded, el => el.child(topBar(this, t, live)))
+      .when(!this.embedded && this.view === "runs" && this.runs !== null, el => el.child(runStrip(this, t, runs, now)))
       .when(!!this.error, el =>
         el.child(
           h_flex()

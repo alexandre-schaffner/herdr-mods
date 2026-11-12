@@ -25,6 +25,20 @@ export async function jobDir() {
   return dir;
 }
 
+/** HQ (mods/hq/hq.py) for the repo `folder` is in: `["workflow-request", ...]` hands a run to
+ *  its master, which spawns an owner session for it (HQ > Workflows shows it). */
+export async function hq(folder, args) {
+  const r = await exec("python3", ["-I", `${appHome()}/mods/hq/hq.py`, "--repo", folder, ...args]);
+  let out;
+  try {
+    out = JSON.parse(r.stdout || "{}");
+  } catch {
+    throw new Error(r.stderr.trim().split("\n").pop() || `hq.py exited ${r.code}`);
+  }
+  if (out.error) throw new Error(out.error);
+  return out;
+}
+
 /** The repo's master chat (master.py): `["plan", folder]` or `["open", folder, space, task]`. */
 export async function master(args) {
   const r = await exec("python3", ["-I", `${appHome()}/mods/master/master.py`, ...args]);

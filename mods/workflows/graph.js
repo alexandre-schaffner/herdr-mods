@@ -5,12 +5,14 @@
 import { h_flex, v_flex } from "gpui-base";
 import { div, PathBuilder } from "gpui-kit";
 import { seg } from "./ui.js";
-import { alpha, icon, kindColor, mix, mono, ok } from "./util.js";
+import { alpha, icon, kindColor, mix, mono, ok, store } from "./util.js";
 
 export const G = {
   laneW: 276, gap: 120, nodeH: 68, nodeGap: 12, head: 64, pad: 28, spine: 22, r: 10,
   // Top to bottom only: the header column, node top to node top between rows, cards apart.
   headW: 220, rowGap: 96, colGap: 16,
+  // Left to right in the run view: a phase that hasn't started, as a narrow column.
+  pendW: 156, pendGap: 56, pendH: 44,
 };
 
 const DIR_KEY = "graph-dir";
@@ -18,13 +20,13 @@ let dir = null;
 
 /** "h" or "v", the person's pick, shared by the run view and the editor. */
 export function graphDir() {
-  if (!dir) dir = localStorage.getItem(DIR_KEY) === "v" ? "v" : "h";
+  if (!dir) dir = store.get(DIR_KEY) === "v" ? "v" : "h";
   return dir;
 }
 
 function setGraphDir(d) {
   dir = d === "v" ? "v" : "h";
-  localStorage.setItem(DIR_KEY, dir);
+  store.set(DIR_KEY, dir);
 }
 
 /** The two-icon switch between left-to-right and top-to-bottom. */
@@ -51,7 +53,7 @@ export function dirSwitch(t, id) {
  * `mid` and `entry` (where a not-started lane's placeholder is met); each node gets
  * `x`, `y`, `cx`, `cy`, `cross` (its center across the flow), `pin` and `pout`.
  */
-function place(lanes, d = "h") {
+function place(lanes, d = "h", compact = false) {
   const most = Math.max(1, ...lanes.map(l => l.nodes.length));
   if (d === "v") {
     const rowW = most * G.laneW + (most - 1) * G.colGap;
@@ -86,13 +88,19 @@ function place(lanes, d = "h") {
   }
   const column = most * (G.nodeH + G.nodeGap) - G.nodeGap;
   const height = G.pad * 2 + G.head + column + 8;
+  let x = G.pad;
   lanes.forEach((lane, i) => {
-    lane.x = G.pad + i * (G.laneW + G.gap);
-    lane.box = { x: lane.x - 12, y: G.pad - 8, w: G.laneW + 24, h: height - G.pad * 2 + 8 };
+    // `compact` (the run view): a phase that hasn't started is a narrow column, closer in.
+    lane.pending = compact && !lane.ghost && !lane.nodes.length;
+    const w = lane.pending ? G.pendW : G.laneW;
+    if (i > 0) x += lane.pending ? G.pendGap : G.gap;
+    lane.x = x;
+    x += w;
+    lane.box = { x: lane.x - 12, y: G.pad - 8, w: w + 24, h: lane.pending ? G.head + G.pendH + 24 : height - G.pad * 2 + 8 };
     lane.flowIn = lane.x;
-    lane.flowOut = lane.x + G.laneW;
-    lane.mid = G.pad + G.head + G.nodeH / 2;
-    lane.entry = lane.x + 20;
+    lane.flowOut = lane.x + w;
+    lane.mid = lane.pending ? G.pad + G.head + G.pendH / 2 : G.pad + G.head + G.nodeH / 2;
+    lane.entry = lane.pending ? lane.x + 12 : lane.x + 20;
     lane.nodes.forEach((n, j) => {
       n.x = lane.x;
       n.y = G.pad + G.head + j * (G.nodeH + G.nodeGap);
@@ -103,11 +111,7 @@ function place(lanes, d = "h") {
       n.pout = { x: n.x + G.laneW, y: n.cy };
     });
   });
-  return {
-    dir: d,
-    width: G.pad * 2 + lanes.length * G.laneW + Math.max(0, lanes.length - 1) * G.gap,
-    height,
-  };
+  return { dir: d, width: x + G.pad, height };
 }
 
 const edgeClass = look =>
@@ -390,9 +394,7 @@ function laneChrome(lane, size, t) {
           .top(G.head + 8)
           .w_full()
           .items_center()
-          .gap(8)
-          .child(placeholder(t, G.laneW - 40, G.nodeH, 13))
-          .child(div().text_size(11).text_color(t.dim).child("Not started"))
+          .child(placeholder(t, lane.box.w - 48, lane.pending ? G.pendH : G.nodeH, 10, "Not started"))
     : null;
   return laneShell(lane, size, t, {
     gap: 9,
@@ -405,7 +407,7 @@ function laneChrome(lane, size, t) {
         .text_color(t.muted)
         .child(lane.nodes.length ? `${lane.done}/${lane.nodes.length}` : "—"),
     ],
-    rows: [
+    rows: !lane.nodes.length ? [] : [
       h_flex()
         .h(3)
         .w_full()
@@ -535,7 +537,7 @@ function nodeCard(n, t, selected, onSelect) {
  * (`lane`, given the lane, the canvas size with its `dir`, and the theme) and edge colors (`palette`).
  */
 export function graph(lanes, t, selectedId, onSelect, opts = {}) {
-  const size = place(lanes, opts.dir ?? graphDir());
+  const size = place(lanes, opts.dir ?? graphDir(), !!opts.compact);
   const { layers, hubs } = edges(lanes, t, size, opts.palette);
   const card = opts.card ?? nodeCard;
   const frame = opts.lane ?? laneChrome;

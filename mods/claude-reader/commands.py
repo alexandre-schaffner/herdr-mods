@@ -2,6 +2,8 @@
 
   python3 -I commands.py [--cwd <dir>]
 
+  python3 -I commands.py --mentions [--cwd <dir>]   files and subagent types for @-mentions
+
 Prints {"commands": [{name, description, source}]}: Claude Code's built-in commands, the
 person's own (~/.claude/commands/**/*.md, and the project's .claude/commands under cwd),
 skills (~/.claude/skills/*/SKILL.md, the project's .claude/skills) and installed plugins'
@@ -89,10 +91,71 @@ def plugins(out, seen):
         skills_in(os.path.join(root, "skills"), f"{name}:", "plugin", out, seen)
 
 
+BUILTIN_AGENTS = [
+    ("general-purpose", "Research, search and multi-step tasks"),
+    ("Explore", "Read-only search across many files"),
+    ("Plan", "Design an implementation plan"),
+]
+MAX_FILES = 40000
+
+
+def agents_in(root, prefix, source, out, seen):
+    for p in sorted(glob.glob(os.path.join(root, "*.md"))):
+        fm, first = frontmatter(p)
+        add(out, seen, prefix + (fm.get("name") or os.path.basename(p)[:-3]), fm.get("description") or first, source)
+
+
+def agents(cwd):
+    out, seen = [], set()
+    for name, desc in BUILTIN_AGENTS:
+        add(out, seen, name, desc, "builtin")
+    if cwd:
+        agents_in(os.path.join(cwd, ".claude", "agents"), "", "project", out, seen)
+    agents_in(os.path.join(CLAUDE, "agents"), "", "user", out, seen)
+    # Installed plugins live under plugins/cache/<marketplace>/<plugin>/<version>/ (newest wins).
+    for root in sorted(glob.glob(os.path.join(CLAUDE, "plugins", "cache", "*", "*", "*")), reverse=True):
+        try:
+            with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+                name = json.load(f).get("name") or os.path.basename(os.path.dirname(root))
+        except (OSError, ValueError):
+            name = os.path.basename(os.path.dirname(root))
+        agents_in(os.path.join(root, "agents"), f"{name}:", "plugin", out, seen)
+    return out
+
+
+def files(cwd):
+    """The folder's files, relative: git's tracked files (untracked ones make big trees slow), else a
+    shallow walk that skips hidden and dependency folders."""
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    try:
+        import subprocess
+        r = subprocess.run(["git", "-C", cwd, "ls-files"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return r.stdout.splitlines()[:MAX_FILES]
+    except (OSError, ValueError):
+        pass
+    found = []
+    skip = {"node_modules", "target", "dist", "build", "__pycache__", ".git"}
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in skip]
+        if dirpath[len(cwd):].count(os.sep) >= 5:
+            dirnames[:] = []
+        for fn in filenames:
+            found.append(os.path.relpath(os.path.join(dirpath, fn), cwd))
+            if len(found) >= MAX_FILES:
+                return found
+    return found
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cwd", default="")
+    ap.add_argument("--mentions", action="store_true", help="files and agents for @-mentions")
     a = ap.parse_args()
+    if a.mentions:
+        print(json.dumps({"files": files(a.cwd), "agents": agents(a.cwd)}, separators=(",", ":")))
+        return
     out, seen = [], set()
     for name, desc in BUILTINS:
         add(out, seen, name, desc, "builtin")

@@ -1,0 +1,10 @@
+{
+  "name": "claude-chat-render",
+  "private": true,
+  "type": "module",
+  "description": "Renders a chat's Mermaid and HTML blocks to images through the system's Chrome (render.mjs).",
+  "dependencies": {
+    "mermaid": "12.3.0",
+    "puppeteer-core": "25.16.0"
+  }
+}

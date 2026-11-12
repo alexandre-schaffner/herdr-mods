@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 
 HOME = os.path.expanduser("~")
@@ -248,6 +249,22 @@ def save_image(block):
             os.replace(path + ".part", path)
         except (OSError, ValueError):
             return None
+    return path
+
+
+def keep_image(src):
+    """A picture a message names by path, copied beside the transcript's own (named by its path,
+    copied once): screenshots sit in temp folders macOS soon empties. None when it's gone."""
+    src = os.path.expanduser(src)
+    path = os.path.join(IMAGES, hashlib.sha1(src.encode()).hexdigest()[:20] + (os.path.splitext(src)[1].lower() or ".png"))
+    if os.path.exists(path):
+        return path
+    try:
+        os.makedirs(IMAGES, exist_ok=True)
+        shutil.copyfile(src, path + ".part")
+        os.replace(path + ".part", path)
+    except OSError:
+        return None
     return path
 
 

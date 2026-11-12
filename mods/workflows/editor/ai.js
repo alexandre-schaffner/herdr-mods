@@ -8,7 +8,7 @@ import { home, readTextFile, writeTextFile } from "herdr";
 import { collect, jobDir } from "../io.js";
 import { blankModel, FIELD_TYPES, normalize } from "../model.js";
 import { btn, iconBtn, kbd } from "../ui.js";
-import { alpha, clip, icon, mono, scrollArea, tildify } from "../util.js";
+import { alpha, clip, icon, mono, scrollArea, store, tildify } from "../util.js";
 import { absPath, addFiles, cwd, filesBox } from "./files.js";
 
 const STR = { type: "string" };
@@ -216,7 +216,7 @@ export function startAI(ed, cx, text, current, request, from) {
   cx.spawn(async cx => {
     try {
       const model = ed.f.get("ai-model")?.value().trim() ?? "";
-      localStorage.setItem(`agent-model:${ed.ai.agent}`, model);
+      store.set(`agent-model:${ed.ai.agent}`, model);
       const dir = await startJob(text, current, cwd(ed), ed.ai.agent, model, ed.ai.files.map(f => absPath(ed, f)));
       ed.ai.job = dir;
     } catch (e) {
@@ -289,7 +289,7 @@ function installedAgents(ed) {
 }
 
 export function pickAgent(ed) {
-  const saved = localStorage.getItem("agent");
+  const saved = store.get("agent");
   if (!ed.agents) return saved ?? "claude";
   const list = installedAgents(ed);
   return list.find(a => a.id === saved)?.id ?? list[0]?.id ?? "claude";
@@ -301,8 +301,8 @@ function agentLabel(ed) {
 
 function setAgent(ed, id, cx) {
   ed.ai.agent = id;
-  localStorage.setItem("agent", id);
-  ed.f.get("ai-model")?.set_value(localStorage.getItem(`agent-model:${id}`) ?? "");
+  store.set("agent", id);
+  ed.f.get("ai-model")?.set_value(store.get(`agent-model:${id}`) ?? "");
   cx.notify();
 }
 
@@ -360,7 +360,7 @@ function modelField(ed, t, prefix, compact) {
             .hover(s => s.bg(alpha(t.accent, 0.15)))
             .on_click((_e, cx) => {
               ed.f.get("ai-model")?.set_value(m);
-              localStorage.setItem(`agent-model:${ed.ai.agent}`, m);
+              store.set(`agent-model:${ed.ai.agent}`, m);
               cx.notify();
             })
             .child(div().font_family(mono()).text_size(10.5).text_color(t.muted).child(m)),

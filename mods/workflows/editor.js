@@ -7,7 +7,7 @@ import { div } from "gpui-kit";
 import { home, notify, settings, spaces } from "herdr";
 import { codeCanvas } from "./codegraph.js";
 import { dirSwitch } from "./graph.js";
-import { collect, master, tempFile } from "./io.js";
+import { collect, hq, tempFile } from "./io.js";
 import {
   asCode,
   CODE_PHASE_STARTER,
@@ -26,7 +26,7 @@ import {
   validate,
 } from "./model.js";
 import { badge, btn, frame, iconBtn, seg } from "./ui.js";
-import { alpha, clip, icon, kindColor, mix, mono, scrollArea, tildify } from "./util.js";
+import { alpha, clip, icon, kindColor, mix, mono, scrollArea, store, tildify } from "./util.js";
 import { composer, generate, heroCard, pickAgent, startAI } from "./editor/ai.js";
 import { canvas, codePane, issueList, MODE_ICON, runCard, strayBar } from "./editor/canvas.js";
 import { addFiles, checkFiles, cwd, repoRoot, search } from "./editor/files.js";
@@ -256,9 +256,9 @@ export class WorkflowEditor {
       this.track("fs:query", st, { arm: false });
       this.f.set("fs:query", st);
     }
-    this.text("ai-model", () => localStorage.getItem(`agent-model:${this.ai?.agent}`) ?? "", null, {
+    this.text("ai-model", () => store.get(`agent-model:${this.ai?.agent}`) ?? "", null, {
       placeholder: "default model",
-      blur: v => localStorage.setItem(`agent-model:${this.ai.agent}`, v.trim()),
+      blur: v => store.set(`agent-model:${this.ai.agent}`, v.trim()),
     });
     // No placeholder setter: an empty composer made for the other mode is made again.
     const aiHint = this.model ? "Ask Claude to change this workflow…" : "Convert this script into an editable workflow, or describe one…";
@@ -688,33 +688,35 @@ export class WorkflowEditor {
     this.launch(cx, {});
   }
 
-  /** Hands the saved workflow to the repo's master chat, which runs and owns it. */
+  /** Hands the saved workflow to the repo's master chat through HQ: the master spawns an owner
+   *  session for it, which runs it in this folder (so a draft saved in a worktree resolves),
+   *  watches it and reports back. HQ > Workflows shows it from the moment it's asked for. */
   launch(cx, args) {
     const go = cx2 => {
       const name = this.name();
       const folder = this.host?.cwd?.() ?? cwd(this);
-      const withArgs = Object.keys(args).length ? `, args: ${JSON.stringify(args)}` : "";
-      // By name: Workflow refuses a scriptPath outside the session's folder, and the master
-      // works in the main checkout. A draft saved in a worktree isn't found by name there.
-      const task =
-        `Run the saved workflow "${name}" with Workflow({name: ${JSON.stringify(name)}${withArgs}}), working in ${folder}. ` +
-        `Its script is ${this.path}; if the name doesn't resolve, pass that file's contents as \`script\`.`;
       const space = spaces().find(s => s.active)?.id ?? "";
       this.runSheet = false;
-      this.notice = { level: "ok", text: "Sending it to the master chat…" };
+      this.notice = { level: "ok", text: "Asking the master for an owner…" };
       cx2.notify();
       cx2.spawn(async cx3 => {
         try {
-          const out = await master(["open", folder, space, task]);
+          const req = ["workflow-request", "--name", name, "--folder", folder, "--by", "person", "--space", space, "--json"];
+          if (this.path) req.push("--script", this.path);
+          if (Object.keys(args).length) req.push("--args-json", JSON.stringify(args));
+          const out = await hq(folder, req);
           this.notice = null;
+          const m = out.master ?? {};
           notify({
-            title: out.started ? `Started the master chat for ${out.repo.name}` : `Sent to the master chat (${out.address})`,
-            body: `It runs and owns "${name}".`,
-            level: "success",
-            timeout: 4000,
+            title: m.sent ? (m.started ? "Started the master chat" : `Sent to the master (${m.address})`) : "Queued for the master",
+            body: m.sent
+              ? `It spawns an owner for "${name}" that runs it and reports back. Follow it in HQ > Workflows.`
+              : `${m.why ?? "The master isn't reachable"}. "${name}" waits in HQ > Workflows.`,
+            level: m.sent ? "success" : "warning",
+            timeout: 5000,
           });
         } catch (e) {
-          this.notice = { level: "error", text: `The master chat didn't get it: ${e?.message ?? e}` };
+          this.notice = { level: "error", text: `HQ didn't take it: ${e?.message ?? e}` };
         }
         cx3.notify();
       });

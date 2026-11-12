@@ -207,7 +207,7 @@ export default class Proxy extends View {
         .when(!!this.error, el => el.child(div().max_w(560).text_size(11.5).text_color(t.dim).child(this.error)));
     const o = { goto: (tab, cx) => this.setTab(tab, cx), routing: (this.routing ??= routingActions(this, SCRIPT(), exec, notify)) };
     const view =
-      this.tab === "models" ? models(t, d) : this.tab === "accounts" ? accounts(t, d) : this.tab === "requests" ? requests(t, d) : overview(t, d, o);
+      this.tab === "models" ? models(t, d) : this.tab === "accounts" ? accounts(t, d, o) : this.tab === "requests" ? requests(t, d) : overview(t, d, o);
     return scrollArea(`scroll-${this.tab}`, v_flex().px(20).py(16).gap(14).child(view));
   }
 

@@ -480,7 +480,7 @@ export function runCard(ed, t) {
             .text_size(12)
             .text_color(t.muted)
             .child(
-              `Opens a Claude Code tab in ${tildify(cwd(ed), home())} and starts the workflow with these arguments.`,
+              `The master spawns an owner session in ${tildify(cwd(ed), home())} that runs it with these arguments and reports back.`,
             ),
         )
         .children(m.args.map(a => field(t, a.name, ed.input(t, `run:${a.name}`), { hint: a.description })))

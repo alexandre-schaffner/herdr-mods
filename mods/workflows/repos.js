@@ -26,7 +26,13 @@ export function shownRepo(app) {
   return app.here ?? null;
 }
 
+/** The shown repository's runs; archived ones only while the strip's Archived toggle is on. */
 export function visibleRuns(app) {
+  return repoRuns(app).filter(r => !r.archivedAt || app.showArchived);
+}
+
+/** Every run of the shown repository, archived or not. */
+export function repoRuns(app) {
   const runs = app.runs ?? [];
   const repo = shownRepo(app);
   return repo ? runs.filter(r => r.repo?.key === repo.key) : runs;

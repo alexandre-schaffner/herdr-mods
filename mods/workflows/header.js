@@ -3,14 +3,12 @@
 
 import { h_flex, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
-import { home } from "herdr";
-import { dirSwitch } from "./graph.js";
 import { hasOutput } from "./output.js";
-import { repoChip, shownRepo } from "./repos.js";
+import { repoChip, repoRuns, shownRepo } from "./repos.js";
 import { livenessLine, ownerChip, resumeButton, resumeConfirm } from "./resume.js";
 import { isLive, RESUMABLE } from "./runs.js";
-import { btn, seg as segmented } from "./ui.js";
-import { ago, alpha, clip, compact, duration, icon, look, mix, mono, ok, tildify } from "./util.js";
+import { btn, iconBtn, seg as segmented } from "./ui.js";
+import { ago, alpha, clip, compact, duration, host, icon, look, mix, mono } from "./util.js";
 
 export function topBar(app, t, live) {
   return h_flex()
@@ -64,6 +62,7 @@ export function topBar(app, t, live) {
 }
 
 export function runStrip(app, t, runs, now) {
+  const shelved = repoRuns(app).filter(r => r.archivedAt).length;
   return h_flex()
     .flex_none()
     .h(78)
@@ -83,7 +82,7 @@ export function runStrip(app, t, runs, now) {
         .overflow_x_scroll()
         .px(14)
         .gap(10)
-        .when(!runs.length, el => el.child(div().text_size(12).text_color(t.dim).child(`No workflow runs in ${shownRepo(app)?.name ?? "this repository"} yet.`)))
+        .when(!runs.length && !shelved, el => el.child(div().text_size(12).text_color(t.dim).child(`No workflow runs in ${shownRepo(app)?.name ?? "this repository"} yet.`)))
         .children(
       runs.map(r => {
         const lk = look(r.status, t);
@@ -97,6 +96,7 @@ export function runStrip(app, t, runs, now) {
           .py(9)
           .gap(5)
           .rounded(11)
+          .when(!!r.archivedAt && !sel, el => el.opacity(0.6))
           .bg(sel ? mix(t.background, t.accent, 0.08) : t.background)
           .border(1)
           .border_color(sel ? t.accent : t.border)
@@ -134,6 +134,7 @@ export function runStrip(app, t, runs, now) {
               .text_color(t.dim)
               .child(
                 [
+                  r.archivedAt ? "archived" : null,
                   r.owner?.master ? "master" : r.owner?.name,
                   when,
                   `${r.agents ?? 0} agents`,
@@ -148,172 +149,134 @@ export function runStrip(app, t, runs, now) {
           );
       }),
     ),
-    );
+    )
+    .when(shelved > 0, el => el.child(archivedToggle(app, t, shelved)));
 }
 
-export function runHeader(app, t, run, lanes, now) {
+/** Shows or hides the repository's archived runs in the strip. */
+function archivedToggle(app, t, n) {
+  const on = app.showArchived;
+  return h_flex()
+    .id("runs-archived")
+    .flex_none()
+    .mx(14)
+    .h(28)
+    .px(10)
+    .gap(6)
+    .items_center()
+    .rounded(8)
+    .border(1)
+    .border_color(on ? t.accent : t.border)
+    .bg(on ? mix(t.background, t.accent, 0.08) : t.background)
+    .cursor_pointer()
+    .hover(s => s.border_color(alpha(t.accent, 0.5)))
+    .tooltip(on ? "Hide archived runs" : "Show archived runs in the strip")
+    .on_click((_e, cx) => app.toggleArchived(cx))
+    .child(icon("archive", 13, on ? t.accent : t.muted))
+    .child(div().text_size(11.5).font_medium().text_color(on ? t.foreground : t.muted).child(`Archived · ${n}`));
+}
+
+export function runHeader(app, t, run, _lanes, now) {
   const lk = look(run.status, t);
-  const span = (run.endedAt ?? now) - (run.startedAt ?? now);
-  const total = lanes.reduce((n, l) => n + l.nodes.length, 0) || 1;
-  const pill = (text, color) =>
-    h_flex()
-      .gap(6)
-      .px(9)
-      .h(22)
-      .rounded_full()
-      .items_center()
-      .bg(alpha(color, 0.13))
-      .child(div().w(6).h(6).rounded_full().bg(color))
-      .child(div().text_size(11).font_medium().text_color(color).child(text));
-  const fact = (name, value) =>
-    h_flex()
-      .gap(5)
-      .items_center()
-      .child(icon(name, 12, t.dim))
-      .child(div().font_family(mono()).text_size(11.5).text_color(t.muted).child(value));
-  const lastLog = run.logs?.[run.logs.length - 1];
+  const live = isLive(run.status);
+  const agents = run.agentList?.length ?? run.agents ?? 0;
+  const took = run.startedAt && run.endedAt > run.startedAt ? duration(run.endedAt - run.startedAt) : null;
+  // A stalled run's liveness line already says when it last changed.
+  const when = live ? `started ${ago(run.startedAt, now)}` : run.status !== "stalled" && run.endedAt ? `ended ${ago(run.endedAt, now)}` : null;
+  const meta = [
+    agents ? `${run.done ?? 0} of ${agents} agents done` : "No agents yet",
+    run.failed ? `${run.failed} failed` : null,
+    when,
+    ["completed", "failed", "killed"].includes(run.status) && took ? `took ${took}` : null,
+    run.tokens != null ? `${compact(run.tokens)} tokens` : null,
+  ]
+    .filter(Boolean)
+    .join("  ·  ");
+  const lastLog = live && !run.liveness?.text ? run.logs?.[run.logs.length - 1] : null;
+  const files = hasOutput(run) ? run.output.files.filter(f => f.exists).length : 0;
+  const extra = host.runExtra?.(t, run) ?? null;
   return v_flex()
     .flex_none()
     .px(28)
-    .pt(22)
-    .pb(18)
-    .gap(10)
+    .pt(20)
+    .pb(16)
+    .gap(8)
     .child(
       h_flex()
         .gap(10)
         .items_center()
-        .child(ownerChip(app, t, run))
-        .child(
-          div()
-            .flex_1()
-            .min_w(0)
-            .font_family(mono())
-            .text_size(10.5)
-            .text_color(t.dim)
-            .truncate()
-            .child([run.id, tildify(run.cwd, home())].filter(Boolean).join("  ·  ")),
-        ),
-    )
-    .child(
-      h_flex()
-        .gap(12)
-        .items_center()
-        .child(div().text_size(23).font_semibold().text_color(t.foreground).child(run.name))
-        .child(pill(lk.label, lk.color))
+        .min_w(0)
+        .child(div().min_w(0).truncate().text_size(18).font_semibold().text_color(t.foreground).child(run.name))
+        .child(statusPill(t, lk))
         .child(div().flex_1())
-        .when(app.runTab(run) === "graph", el => el.child(dirSwitch(t, "run-dir")))
         .child(
           segmented(t, "run-tab", [
-            { id: "graph", label: "Graph", icon: "flow" },
-            { id: "terminals", label: "Terminals", icon: "terminal" },
-            ...(hasOutput(run)
-              ? [{ id: "output", label: run.output.files.filter(f => f.exists).length ? `Output · ${run.output.files.filter(f => f.exists).length}` : "Output", icon: "sparkles" }]
-              : []),
+            { id: "graph", label: "Graph" },
+            { id: "terminals", label: "Terminals" },
+            ...(hasOutput(run) ? [{ id: "output", label: files ? `Output ${files}` : "Output" }] : []),
           ], app.runTab(run), (id, cx) => app.setRunTab(id, cx), { size: "sm" }),
         )
         .when(RESUMABLE.includes(run.status), el => el.child(resumeButton(app, t, run)))
-        .child(btn(t, "edit-run", "Edit as workflow", cx => app.editRun(cx), { icon: "square-pen", size: "sm", tooltip: "Open this run's script in the editor" })),
+        .child(archiveButton(app, t, run))
+        .child(iconBtn(t, "edit-run", "square-pen", cx => app.editRun(cx), "Edit as workflow: open this run's script in the editor", { size: 26 })),
+    )
+    .when(!!run.description, el =>
+      el.child(div().max_w(880).text_size(12.5).line_height(1.5).text_color(t.muted).child(clip(run.description, 220))),
     )
     .when(!!run.liveness?.text, el => el.child(livenessLine(app, t, run)))
-    .when(app.resume?.runId === run.id && app.resume.phase === "armed", el => el.child(resumeConfirm(app, t, run)))
-    .when(!!run.description, el =>
-      el.child(
-        div().max_w(880).text_size(12.5).line_height(1.5).text_color(t.muted).child(clip(run.description, 260)),
-      ),
-    )
-    .child(
-      h_flex()
-        .gap(18)
-        .items_center()
-        .child(fact("clock", duration(span)))
-        .child(fact("layers", `${run.done ?? 0}/${run.agentList?.length ?? run.agents ?? 0} agents`))
-        .when(run.tokens != null, el => el.child(fact("bolt", `${compact(run.tokens)} tokens`)))
-        .when(run.toolCalls != null, el => el.child(fact("wrench", `${run.toolCalls} tool calls`)))
-        .child(
-          div()
-            .text_size(11.5)
-            .text_color(t.dim)
-            .child(isLive(run.status) ? `started ${ago(run.startedAt, now)}` : `finished ${ago(run.endedAt, now)}`),
-        ),
-    )
-    .child(
-      h_flex()
-        .mt(4)
-        .gap(4)
-        .w_full()
-        .max_w(880)
-        .children(
-          lanes.map(l => {
-            const n = l.nodes.length || 1;
-            return v_flex()
-              .w(`${Math.max(6, (l.nodes.length / total) * 100)}%`)
-              .gap(5)
-              .child(
-                h_flex()
-                  .h(5)
-                  .rounded_full()
-                  .overflow_hidden()
-                  .bg(alpha(t.foreground, 0.08))
-                  .child(
-                    div()
-                      .h_full()
-                      .w(`${(l.done / n) * 100}%`)
-                      .bg(ok(t)),
-                  )
-                  .child(
-                    div()
-                      .h_full()
-                      .w(`${(l.failed / n) * 100}%`)
-                      .bg(t.blocked),
-                  )
-                  .child(
-                    div()
-                      .h_full()
-                      .w(`${(l.live / n) * 100}%`)
-                      .bg(t.working)
-                      .loop("opacity", { from: 0.4, to: 1, period: 1200 }),
-                  ),
-              )
-              .child(
-                div()
-                  .truncate()
-                  .text_size(10)
-                  .text_color(l.live ? t.working : t.dim)
-                  .child(l.title),
-              );
-          }),
-        ),
-    )
     .when(!!run.error, el =>
       el.child(
         h_flex()
           .gap(8)
-          .px(12)
-          .py(8)
-          .rounded(9)
+          .items_center()
           .max_w(880)
-          .bg(alpha(t.blocked, 0.1))
-          .border(1)
-          .border_color(alpha(t.blocked, 0.35))
-          .child(icon("x", 13, t.blocked))
-          .child(
-            div()
-              .flex_1()
-              .text_size(11.5)
-              .text_color(t.blocked)
-              .child(clip(String(run.error), 300)),
-          ),
+          .child(icon("x", 12, t.blocked))
+          .child(div().flex_1().min_w(0).text_size(11.5).text_color(t.blocked).child(clip(String(run.error), 300))),
       ),
     )
     .when(!!lastLog && !run.error, el =>
       el.child(
         h_flex()
-          .gap(7)
+          .gap(8)
           .items_center()
+          .max_w(880)
           .child(icon("terminal", 12, t.dim))
-          .child(
-            div().flex_1().min_w(0).truncate().font_family(mono()).text_size(11).text_color(t.dim).child(lastLog),
-          ),
+          .child(div().flex_1().min_w(0).truncate().font_family(mono()).text_size(11).text_color(t.dim).child(lastLog)),
       ),
-    );
+    )
+    .child(
+      h_flex()
+        .gap(12)
+        .items_center()
+        .min_w(0)
+        .child(div().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(meta))
+        .child(ownerChip(app, t, run)),
+    )
+    .when(app.resume?.runId === run.id && app.resume.phase === "armed", el => el.child(resumeConfirm(app, t, run)))
+    .when(!!extra, el => el.child(extra));
+}
+
+function statusPill(t, lk) {
+  return h_flex()
+    .flex_none()
+    .gap(6)
+    .px(8)
+    .h(20)
+    .rounded_full()
+    .items_center()
+    .bg(alpha(lk.color, 0.12))
+    .child(div().w(6).h(6).rounded_full().bg(lk.color).when(lk.key === "running", el => el.loop("opacity", { from: 0.3, to: 1, period: 1000 })))
+    .child(div().text_size(11).font_medium().text_color(lk.color).child(lk.label));
+}
+
+/** Archive / Unarchive for the shown run. A running run stays: archiving would hide live work. */
+function archiveButton(app, t, run) {
+  const shelved = (app.runs ?? []).find(r => r.id === run.id)?.archivedAt;
+  if (shelved)
+    return iconBtn(t, "unarchive-run", "archive", cx => app.archiveRun(run.id, false, cx), "Archived. Click to bring it back to the list.", { size: 26, color: t.accent });
+  const live = isLive(run.status);
+  return iconBtn(t, "archive-run", "archive", cx => app.archiveRun(run.id, true, cx), live ? "Still running: archive it once it ends" : "Archive: hide it from the list. Nothing is deleted.", {
+    size: 26,
+    disabled: live,
+  });
 }

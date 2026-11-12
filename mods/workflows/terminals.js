@@ -7,7 +7,7 @@ import { closeOverlay, home, openOverlay, panes, props, run, spaces } from "herd
 import { glyph } from "./graph.js";
 import { splitLabel } from "./runs.js";
 import { btn, iconBtn, seg } from "./ui.js";
-import { ago, alpha, duration, icon, kindColor, look, mix, mono, ok, scrollArea, tildify } from "./util.js";
+import { ago, alpha, duration, host, icon, kindColor, look, mix, mono, ok, scrollArea, tildify } from "./util.js";
 
 /** px per terminal line; every line is one, so the list can be virtual. */
 const LH = 18;
@@ -21,6 +21,7 @@ const EXIT = /^Exit code (\d+)/;
 
 /** Brings a terminal forward where it lives: its tab when it has a pane, else a peek. */
 export function focusTerminal(addr) {
+  host.leave();
   const pane = panes().find(p => p.terminal === addr);
   if (!pane) return run("terminal.peek", { terminal: addr });
   const space = spaces().find(s => s.tabs.some(tab => tab.id === pane.tab));

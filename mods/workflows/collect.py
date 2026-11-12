@@ -52,6 +52,8 @@ def cmd_script(run_id):
 COMMANDS = {
     "list": (runs.cmd_list, 0),
     "run": (runs.cmd_run, 1),
+    "archive": (runs.cmd_archive, 1),
+    "unarchive": (runs.cmd_unarchive, 1),
     "agent": (transcript.cmd_agent, 2),
     "shell": (transcript.cmd_shell, 2),
     "script": (cmd_script, 1),
