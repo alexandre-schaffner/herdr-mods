@@ -29,18 +29,7 @@
               "id": "spaces",
               "type": "block",
               "content": {
-                "mod": "my-spaces"
-              },
-              "size": {
-                "weight": 1
-              },
-              "min": 90
-            },
-            {
-              "id": "agents",
-              "type": "block",
-              "content": {
-                "mod": "agents"
+                "mod": "my-org"
               },
               "size": {
                 "weight": 1

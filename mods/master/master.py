@@ -24,16 +24,22 @@ import masters  # noqa: E402
 from repos import repo_of  # noqa: E402
 sys.path.insert(1, os.path.join(os.path.dirname(HERE), "hq"))
 import hcguard  # noqa: E402
+import answer_guard  # noqa: E402
 
 PROMPT = os.path.join(HERE, "master.md")
+RUNNER_PROMPT = os.path.join(HERE, "runner.md")
 LABEL = masters.LABEL
-MODEL = "opus[1m]"
+MODEL = "claude-fable-5-2"  # Fable 5.2, 1M context natively
+RUNNER_MODEL = "haiku"  # the loop runner: routine ticks, escalates judgment to the master
 SKILL = "/pstack:poteto-mode"
 FIRST = "You are this repository's master chat. Read your memory, then wait for my first request."
 # A new master starts in poteto mode and perpetual (see "Poteto mode" and "The tick" in master.md).
 START = "You are this repository's master chat. Read your memory, then start your perpetual tick: invoke the loop skill with 'master tick' (self-paced)."
+# With a loop runner (HQ settings: runner), the master doesn't loop: the runner ticks and escalates.
+START_RUNNER = "You are this repository's master chat. Read your memory and your handoff (`hq handoff`), then end the turn: the loop runner runs the tick and sends you `HQ ESCALATION` lines; you act on those, on decisions and on the person."
 # A resumed master lost its loop with its process: it re-arms from its handoff.
 RESUMED = "You were restarted. Read your handoff (`hq handoff`), then restart your perpetual tick: invoke the loop skill with 'master tick' (self-paced)."
+RESUMED_RUNNER = "You were restarted. Read your handoff (`hq handoff`), then end the turn: the loop runner runs the tick and sends you `HQ ESCALATION` lines."
 
 
 def herdr(*args):
@@ -94,10 +100,12 @@ def start(repo, space, task):
         sid = str(uuid.uuid4())
     epic = repo.get("epic")
     argv = [*masters.claude_env(repo), *hcguard.env(repo), "claude", "--model", MODEL, "--name", f"master · {repo['name']}", "--append-system-prompt-file", PROMPT,
-            *(["--resume", sid] if resume else ["--session-id", sid])]
+            "--settings", answer_guard.settings(), *(["--resume", sid] if resume else ["--session-id", sid])]
     who = (f"You are the master chat for the epic '{epic}' of this repository (HQ_EPIC={epic}): your managers, merge queue, "
            f"roadmap, inbox and to-dos are this epic's alone, and its worktrees are the '{epic}' group in the sidebar. ") if epic else ""
-    first = f"{SKILL} {who}{RESUMED}{' ' + task if task else ''}" if resume else f"{SKILL} {who}{task or START}"
+    ran = runner_on(repo)
+    first = (f"{SKILL} {who}{RESUMED_RUNNER if ran else RESUMED}{' ' + task if task else ''}" if resume
+             else f"{SKILL} {who}{task or (START_RUNNER if ran else START)}")
     tab = f"Master · {epic}" if epic else "Master"
     # An epic's master gets a space of its own; the main master starts where the repo is worked on.
     space = space if epic else home_space(repo, space)
@@ -116,6 +124,57 @@ def start(repo, space, task):
         pass  # cosmetic: the master works out of place
     pin(addr)
     return {"address": addr, "sessionId": sid, "resumed": resume, "typed": first, "labelled": labelled}
+
+
+def runner_on(repo):
+    """The org's HQ setting `runner` (default on): a loop runner runs the master's tick."""
+    got = claude.read_json(os.path.join(claude.APP_HOME, "data", "hq", hcguard.org_name(repo), "settings.json"))
+    return not (isinstance(got, dict) and got.get("runner") is False)
+
+
+def runner_model(repo):
+    got = claude.read_json(os.path.join(claude.APP_HOME, "data", "hq", hcguard.org_name(repo), "settings.json"))
+    return (got.get("runnerModel") if isinstance(got, dict) else None) or RUNNER_MODEL
+
+
+def master_space(addr):
+    """(space id, tab id) of the terminal `addr`, from herdr's layout."""
+    for sp in herdr("ls").get("spaces") or []:
+        for tab in sp.get("tabs") or []:
+            if any(t.get("terminal") == addr for t in tab.get("terminals") or []):
+                return sp["id"], tab.get("id")
+    return None, None
+
+
+def cmd_runner(folder, epic=None):
+    """Starts the master's loop runner beside it (a tab 'Loop' in the master's space), unless one
+    runs. A fresh session each time: its state lives in HQ (tick, handoff, loop), not in it."""
+    repo = masters.scope_of(repo_of(os.path.realpath(os.path.expanduser(folder))), epic)
+    if not repo:
+        return {"error": "no folder given"}
+    with masters.lock():
+        got = masters.find_runner(repo, scan=True)
+        if got:
+            return {"ok": True, "started": False, "address": got["address"]}
+        mt = masters.find(repo)["terminal"]
+        if not mt:
+            return {"error": "the master isn't running: start it first"}
+        space, _ = master_space(mt["address"])
+        sid = str(uuid.uuid4())
+        name = f"loop · {repo['name']}"
+        argv = [*masters.claude_env(repo), *hcguard.env(repo), "claude", "--model", runner_model(repo), "--name", name,
+                "--append-system-prompt-file", RUNNER_PROMPT, "--settings", answer_guard.settings(), "--session-id", sid]
+        tab = f"Loop · {repo['epic']}" if repo.get("epic") else "Loop"
+        args = ["--folder", repo["path"], "--argv", json.dumps(argv), "--task", masters.LOOP_PROMPT]
+        made = (herdr("do", "tab.new", "--space", space, "--name", tab, *args) if space
+                else herdr("do", "space.new", "--name", repo.get("epic") or repo["name"], "--tab", tab, *args))
+        addr = made.get("terminal")
+        if not addr:
+            return {"error": "herdr made no terminal: " + json.dumps(made)}
+        masters.record(repo["key"], runner={"terminal": addr, "sessionId": sid, "startedAt": int(time.time() * 1000)})
+        for label in (f"{masters.RUNNER_LABEL}={repo['key']}", f"{hcguard.LABEL}={hcguard.org_name(repo)}"):
+            subprocess.run(["hc", "label", addr, label], capture_output=True, timeout=15)
+        return {"ok": True, "started": True, "address": addr, "sessionId": sid}
 
 
 def pin(addr):
@@ -169,10 +228,12 @@ def main(argv):
     try:
         if cmd == "plan" and a:
             out = cmd_plan(a[0], epic)
+        elif cmd == "runner" and a:
+            out = cmd_runner(a[0], epic)
         elif cmd == "open" and a:
             out = cmd_open(a[0], a[1] if len(a) > 1 else "", a[2] if len(a) > 2 else "", epic)
         else:
-            out = {"error": "usage: master.py plan <folder> [--epic E] | open <folder> [space] [task] [--epic E]"}
+            out = {"error": "usage: master.py plan <folder> [--epic E] | open <folder> [space] [task] [--epic E] | runner <folder> [--epic E]"}
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         out = {"error": str(e)}
     json.dump(out, sys.stdout, separators=(",", ":"))
