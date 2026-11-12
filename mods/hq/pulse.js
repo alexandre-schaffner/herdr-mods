@@ -5,7 +5,7 @@
 import { h_flex, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 
-import { ago, alpha, btn, chip, clip, empty, icon, ok, row, scrollY, SP, TYPE, tint, tone } from "./ui.js";
+import { alpha, btn, chip, clip, empty, icon, linkBtn, ok, onTint, row, scrollY, sectionHead, SP, timeAgo, tint, tone, TYPE } from "./ui.js";
 
 const ACTION_WORD = {
   "loop-arm": "Arm loop",
@@ -51,20 +51,12 @@ export class PulseView {
       .child(this.comms(t, d));
   }
 
-  heading(t, text, count) {
-    return h_flex()
-      .gap(SP.sm)
-      .items_center()
-      .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child(text))
-      .when(count != null, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child(String(count))));
-  }
-
   signals(t, d) {
     const sig = d.signals ?? [];
     const color = s => (s.level === "alert" ? t.blocked : s.level === "warn" ? tone(t).warn : t.muted);
     return v_flex()
       .gap(SP.sm)
-      .child(this.heading(t, "Bottlenecks", sig.length || null))
+      .child(sectionHead(t, { level: "title", title: "Bottlenecks", count: sig.length || null }))
       .when(!sig.length, el =>
         el.child(
           h_flex()
@@ -95,7 +87,7 @@ export class PulseView {
                 .pl(21)
                 .gap(SP.sm)
                 .items_center()
-                .child(div().text_size(TYPE.meta).font_medium().text_color(color(s)).child(s.who))
+                .child(div().text_size(TYPE.meta).font_medium().text_color(s.level === "info" ? t.muted : onTint(t, color(s))).child(s.who))
                 .when(!!s.terminal, el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(s.terminal)))
                 .child(div().flex_1())
                 .when(!!s.action, el =>
@@ -114,7 +106,7 @@ export class PulseView {
     const rows = (d.activity ?? []).slice(0, 40);
     return v_flex()
       .gap(SP.sm)
-      .child(this.heading(t, "HQ log"))
+      .child(sectionHead(t, { level: "title", title: "HQ log" }))
       .when(!rows.length, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child("Decisions, org changes and autopilot chores show here.")))
       .children(
         rows.map((r, i) =>
@@ -123,7 +115,7 @@ export class PulseView {
             .py(5)
             .gap(SP.md)
             .items_start()
-            .child(div().w(52).flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(ago(r.at, d.now)))
+            .child(timeAgo(t, r.at, d.now, { w: 52 }).pt(1))
             .child(
               v_flex()
                 .flex_1()
@@ -178,13 +170,7 @@ export class PulseView {
           .gap(SP.sm)
           .border_b(1)
           .border_color(alpha(t.border, 0.7))
-          .child(
-            h_flex()
-              .gap(SP.sm)
-              .items_center()
-              .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("Conversation"))
-              .child(div().text_size(TYPE.ui).text_color(t.muted).child("between the master and its org, newest first")),
-          )
+          .child(sectionHead(t, { level: "title", title: "Conversation", hint: "between the master and its org, newest first" }))
           .child(
             h_flex()
               .gap(2)
@@ -257,23 +243,15 @@ export class PulseView {
           .when(!!name, el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(c.peer)))
           .when(!!tag, el => el.child(chip(t, tag === "QUEUED-GREEN" ? "Queued green" : tag[0] + tag.slice(1).toLowerCase(), tagColor)))
           .child(div().flex_1())
-          .child(div().text_size(TYPE.meta).text_color(t.muted).child(ago(c.at, now))),
+          .child(timeAgo(t, c.at, now)),
       )
       .child(div().max_w(760).text_size(TYPE.body).line_height(1.5).text_color(t.foreground).child(full || !long ? c.text : clip(c.text, CLIP)))
       .when(long, el =>
         el.child(
-          div()
-            .id(`msg-more-${i}`)
-            .text_size(TYPE.meta)
-            .font_medium()
-            .text_color(t.accent)
-            .cursor_pointer()
-            .hover(s => s.underline())
-            .on_click((_e, cx) => {
-              full ? this.open.delete(key) : this.open.add(key);
-              cx.notify();
-            })
-            .child(full ? "Show less" : "Show more"),
+          linkBtn(t, `msg-more-${i}`, full ? "Show less" : "Show more", cx => {
+            full ? this.open.delete(key) : this.open.add(key);
+            cx.notify();
+          }),
         ),
       );
   }

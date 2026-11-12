@@ -1,22 +1,33 @@
 #!/usr/bin/env -S python3 -I
-"""hc behind HQ's org wall (hcguard.py): refuses a cross-org target with exit 3, else runs the real hc.
+"""hc behind HQ's org wall (hcguard.py): refuses a cross-org target with exit 3, files an org
+session's `hc send` to its master in the master's mailbox (`hq tell`), else runs the real hc.
 HC_GUARD_DRY=1 prints the decision instead of running anything."""
 
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import hcguard  # noqa: E402
 
 
+HQ_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hq.py")
+
+
 def main(args):
     why = hcguard.refusal(args)
+    mail = None if why else hcguard.mailbox_target(args)
     if os.environ.get("HC_GUARD_DRY"):
-        print(why or f"hc: allowed: hc {' '.join(args[:2])}")
+        print(why or (f"hc: to the master's mailbox ({mail['folder']} {mail['epic']})" if mail else f"hc: allowed: hc {' '.join(args[:2])}"))
         sys.exit(3 if why else 0)
     if why:
         sys.stderr.write(why + "\n")
         sys.exit(3)
+    if mail:
+        # Filed with `hq tell` (it prints what happened); if that fails, the message is typed as before.
+        r = subprocess.run([sys.executable, "-I", HQ_PY, "--repo", mail["folder"], "--epic", mail["epic"], "tell", "--via-hc", mail["text"]])
+        if r.returncode == 0:
+            sys.exit(0)
     real = hcguard.real_hc()
     os.execv(real, [real, *args])
 

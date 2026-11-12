@@ -5,7 +5,7 @@ import { h_flex, Input, InputState, Scrollbar, TextView, v_flex, v_virtual_list 
 import { div } from "gpui-kit";
 
 import { openLink } from "./shared/viewer-link.js";
-import { ago, alpha, btn, card, chip, clip, dot, empty, facts, frame, icon, label, mono, ok, scrollY, row, tint, tone } from "./ui.js";
+import { ago, alpha, banner, btn, card, chip, clip, dot, empty, facts, frame, icon, lines, loading, mono, ok, row, scrollY, sectionHead, segmented, stamp, tint, tone, toolbar, TYPE } from "./ui.js";
 
 const MAX_DIFF_LINES = 400;
 const ENTRY_H = 80;
@@ -137,7 +137,7 @@ export class MemoryView {
     if (!this.mem)
       return this.error
         ? empty(t, "Couldn't read memory", this.error, { icon: "brain", action: btn(t, "mem-retry", "Retry", cx => this.load(cx)) })
-        : empty(t, "Reading ~/agent-memory…", null, { icon: "brain" });
+        : loading(t, "Reading ~/agent-memory…");
     return row()
       .flex_1()
       .min_h(0)
@@ -165,9 +165,9 @@ export class MemoryView {
           this.tab = "entries";
           cx.notify();
         })
-        .child(icon(name ? "file-md" : "layers", 13, on ? t.accent : t.dim))
+        .child(icon(name ? "file-md" : "layers", 13, on ? t.accent : t.muted))
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(on ? t.foreground : t.muted).child(name || "All files"))
-        .child(div().text_size(10.5).font_family(mono()).text_color(t.dim).child(`${count}${bytes != null ? ` · ${Math.round(bytes / 1024)}k` : ""}`));
+        .child(div().text_size(10.5).font_family(mono()).text_color(t.muted).child(`${count}${bytes != null ? ` · ${Math.round(bytes / 1024)}k` : ""}`));
     return v_flex()
       .flex_none()
       .w(264)
@@ -258,58 +258,32 @@ export class MemoryView {
   }
 
   toolbar(t) {
-    const seg = (id, text, on, onClick) =>
-      h_flex()
-        .id(id)
-        .h(24)
-        .px(10)
-        .items_center()
-        .rounded(6)
-        .text_size(12)
-        .cursor_pointer()
-        .when(on, el => el.bg(t.background).text_color(t.foreground).font_medium().shadow_sm())
-        .when(!on, el => el.text_color(t.muted).hover(s => s.text_color(t.foreground)))
-        .on_click((_e, cx) => {
-          onClick(cx);
-          cx.notify();
-        })
-        .child(text);
-    return h_flex()
-      .flex_none()
-      .h(46)
-      .px(14)
-      .gap(10)
-      .items_center()
-      .border_b(1)
-      .border_color(t.border)
-      .child(
-        h_flex()
-          .p(3)
-          .gap(2)
-          .rounded(8)
-          .bg(alpha(t.foreground, 0.055))
-          .child(seg("mem-tab-e", "Entries", this.tab === "entries", () => (this.tab = "entries")))
-          .child(
-            seg("mem-tab-h", "History", this.tab === "history", cx => {
-              this.tab = "history";
-              if (!this.commit && this.mem.log?.length) this.pickCommit(this.mem.log[0].sha, cx);
+    const tabs = [
+      { id: "e", label: "Entries" },
+      { id: "h", label: "History" },
+    ];
+    const sorts = [
+      { id: "f", label: "By file" },
+      { id: "r", label: "Recent first" },
+    ];
+    return toolbar(t, [
+      segmented(t, "mem-tab", tabs, this.tab === "entries" ? "e" : "h", (id, cx) => {
+        this.tab = id === "e" ? "entries" : "history";
+        if (this.tab === "history" && !this.commit && this.mem.log?.length) this.pickCommit(this.mem.log[0].sha, cx);
+        cx.notify();
+      }),
+      ...(this.tab === "entries"
+        ? [
+            segmented(t, "mem-sort", sorts, this.sort === "file" ? "f" : "r", (id, cx) => {
+              this.sort = id === "f" ? "file" : "recent";
+              cx.notify();
             }),
-          ),
-      )
-      .when(this.tab === "entries", el =>
-        el.child(
-          h_flex()
-            .p(3)
-            .gap(2)
-            .rounded(8)
-            .bg(alpha(t.foreground, 0.055))
-            .child(seg("mem-sort-f", "By file", this.sort === "file", () => (this.sort = "file")))
-            .child(seg("mem-sort-r", "Recent first", this.sort === "recent", () => (this.sort = "recent"))),
-        ),
-      )
-      .child(div().flex_1())
-      .child(div().text_size(11).text_color(t.dim).child((this.mem.root ?? "~/agent-memory").replace(/^\/Users\/[^/]+/, "~")))
-      .child(btn(t, "mem-refresh", "", cx => this.load(cx), { size: "sm", kind: "ghost", icon: "repeat", tooltip: "Reload", disabled: this.loading }));
+          ]
+        : []),
+      div().flex_1(),
+      div().text_size(TYPE.meta).text_color(t.muted).child((this.mem.root ?? "~/agent-memory").replace(/^\/Users\/[^/]+/, "~")),
+      btn(t, "mem-refresh", "", cx => this.load(cx), { size: "sm", kind: "ghost", icon: "repeat", tooltip: "Reload", disabled: this.loading }),
+    ]);
   }
 
   entryPane(t) {
@@ -337,7 +311,7 @@ export class MemoryView {
           .cursor_pointer()
           .when(on, el => el.bg(tint(t).on))
           .when(!on, el => el.hover(s => s.bg(tint(t).hover)))
-          .child(div().h(36).overflow_hidden().text_size(12.5).line_height(1.4).text_color(t.foreground).child(clip(r.text, perLine * 2 - 4)))
+          .child(lines(r.text, 12.5, 2, perLine - 2, 1.4).h(36).text_color(t.foreground))
           .child(div().truncate().text_size(11).text_color(r.updated ? t.accent : t.muted).child(meta || " "));
       }),
     )
@@ -362,7 +336,7 @@ export class MemoryView {
               cx.notify();
             }
           })
-          .child(h_flex().px(16).py(8).border_b(1).border_color(t.border).child(label(t, `${rows.length} entr${rows.length === 1 ? "y" : "ies"}`)))
+          .child(div().px(16).py(8).border_b(1).border_color(t.border).child(sectionHead(t, { title: "Entries", count: rows.length })))
           .child(v_flex().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("mem-entries").mode("always").absolute().inset_0())),
       )
       .child(v_flex().flex_none().w(460).min_w(0).min_h(0).border_l(1).border_color(t.border).bg(t.background).child(this.entryDetail(t, sel)));
@@ -413,7 +387,7 @@ export class MemoryView {
               .items_center()
               .items_start()
               .when(x.dream, el => el.child(div().pt(2).child(icon("sparkles", 11, t.accent))))
-              .child(div().flex_1().min_w(0).h(17).overflow_hidden().text_size(12.5).text_color(t.foreground).child(clip(x.subject, 52))),
+              .child(lines(x.subject, 12.5, 1, 52).flex_1().text_color(t.foreground)),
           )
           .child(div().truncate().text_size(11).text_color(t.muted).child([ago(x.at), shortStat(x.stat), x.sha.slice(0, 7)].filter(Boolean).join("  ·  ")));
       }),
@@ -454,16 +428,16 @@ export class MemoryView {
       .child(
         h_flex()
           .gap(10)
-          .text_size(11)
-          .text_color(t.dim)
+          .text_size(TYPE.meta)
+          .text_color(t.muted)
           .child(div().font_family(mono()).child(c.sha.slice(0, 10)))
-          .child(div().child(new Date(c.at).toLocaleString()))
+          .child(div().child(stamp(c.at)))
           .child(div().child(c.stat ?? "")),
       );
     const d = this.diff?.sha === c.sha ? this.diff : null;
     let body;
-    if (!d || d.loading) body = div().p(14).text_size(12).text_color(t.dim).child("Loading the change…");
-    else if (d.error) body = div().p(14).text_size(12).text_color(t.blocked).child(d.error);
+    if (!d || d.loading) body = loading(t, "Loading the change…");
+    else if (d.error) body = banner(t, { tone: t.blocked, text: d.error });
     else body = scrollY(`mem-diff-${c.sha}`, this.diffView(t, d.text));
     return v_flex().flex_1().min_h(0).child(head).child(body);
   }
@@ -512,7 +486,7 @@ export class MemoryView {
       .gap(4)
       .when(!!message, el => el.child(div().pb(10).text_size(12).text_color(t.muted).child(TextView.markdown("mem-commit-msg", message).selectable(true))))
       .children(out)
-      .when(truncated, el => el.child(div().pt(8).text_size(11).text_color(t.dim).child(`Only the first ${MAX_DIFF_LINES} changed lines are drawn.`)))
-      .when(!out.length, el => el.child(div().text_size(12).text_color(t.dim).child("No line changes.")));
+      .when(truncated, el => el.child(div().pt(8).text_size(TYPE.meta).text_color(t.muted).child(`Only the first ${MAX_DIFF_LINES} changed lines are drawn.`)))
+      .when(!out.length, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child("No line changes.")));
   }
 }

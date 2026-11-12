@@ -5,6 +5,9 @@ Every master and manager carries the label `herdr.hq.org=<org folder name>` (dat
 `refusal` before a command that reaches into a terminal (send, keys, interrupt, kill, put, rm,
 label); read-only commands pass. A master may still write to another org's master (never to
 its managers), and terminals with no org label (the person's shells, unit sessions) are open.
+
+`mailbox_target` is the other half of bin/hc: an org session's `hc send` to its master goes to
+the master's mailbox (`hq tell`) instead of its terminal.
 """
 
 import os
@@ -17,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "bin")
 LABEL = "herdr.hq.org"
 MASTER = "herdr.master"
+RUNNER = "herdr.runner"  # a master's loop runner, labelled with its master's registry key
 GUARDED = {"send", "keys", "interrupt", "kill", "put", "rm", "label"}
 VALUED = {"--if", "--timeout"}  # hc flags that take a value
 REAL_FALLBACK = os.path.expanduser("~/.local/share/herdr-core/current/Contents/MacOS/herdr-core")
@@ -58,15 +62,44 @@ def terminal(addr):
 
 def target_of(args):
     """The terminal an hc command addresses: its first positional argument."""
-    skip = False
+    return next(iter(positionals(args)), None)
+
+
+def positionals(args):
+    """An hc command's positional arguments, flags and their values skipped."""
+    got, skip = [], False
     for a in args:
         if skip:
             skip = False
         elif a in VALUED:
             skip = True
         elif not a.startswith("-"):
-            return a
-    return None
+            got.append(a)
+    return got
+
+
+def mailbox_target(args):
+    """For `hc send <a master> <text>` from an org session that isn't a master (a manager, a
+    workflow owner, a unit): where `hq tell` files it instead, as {folder, epic, text}, so reports
+    land in the master's mailbox (mail.py) rather than in the person's conversation with it.
+    None otherwise: the person's own shells and HQ's chat carry no terminal id, masters write to
+    each other directly, and a loop runner types into its own master (`hq escalate`). Filed as
+    mail, an escalation would wake the runner itself, whose tick reads it, and never the master."""
+    if not args or args[0] != "send":
+        return None
+    pos = positionals(args[1:])
+    me = os.environ.get("HC_TERMINAL_ID") or os.environ.get("HERDR_TERMINAL")
+    if len(pos) < 2 or not me:
+        return None
+    t = terminal(pos[0])
+    key = ((t or {}).get("labels") or {}).get(MASTER)
+    if not key or not t.get("cwd"):
+        return None
+    mine = (terminal(me) or {}).get("labels") or {}
+    if MASTER in mine or mine.get(RUNNER) == key or not (os.environ.get("HQ_ORG") or mine.get(LABEL) or mine.get("herdr.hq.manager")):
+        return None
+    epic = key.partition("#")[2]
+    return {"folder": t["cwd"], "epic": epic or "-", "text": " ".join(pos[1:])}
 
 
 def refusal(args, fallback_org=None):

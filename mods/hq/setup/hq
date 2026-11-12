@@ -1,0 +1,3 @@
+#!/bin/sh
+# HQ: the master chat's review inbox, org and status (~/.config/herdr-app/mods/hq/hq.py).
+exec python3 -I "$HOME/.config/herdr-app/mods/hq/hq.py" "$@"

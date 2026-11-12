@@ -9,19 +9,18 @@ Herdr's shipped mods, state and caches.
 | `workflows` | Claude Code dynamic workflows as a live graph (left to right or top to bottom), each agent's shell as a terminal, the owning session's live terminal, run outputs, and a workflow editor and library (`cmd-shift-g`; `cmd-s` saves, `cmd-enter` generates) |
 | `master` | `cmd-alt-m`: go to the repo's master chat, starting or resuming it in a pinned Master tab (`master.py`, prompt `master.md`, state in `data/master/masters.json`) |
 | `claude-reader` | A Claude Code chat as a clean, live document, over or beside its terminal (`cmd-shift-m`) |
-| `hq` | `cmd-shift-h`: HQ, the master chat's desk as a main view (the `center` stack in `my-main`): live org map, next moves, review inbox, chat, roster, brief, proxy usage, memory and prompts. Agents drive it with `hq` (`hq.py`, `~/.local/bin/hq`; state in `data/hq/<repo>/`) |
+| `hq` | `cmd-shift-h`: HQ, the desk over the master chat and its org of managers, as a main view (the `center` stack in `my-main`): home update, live map, roster, loops, roadmap, next moves, merge queues, review inbox, chat, workflows, library, usage, memory and prompts. Agents drive it with `hq`. **Setup, use and customizing: [`mods/hq/README.md`](mods/hq/README.md)** |
 | `proxy` | `cmd-shift-u`: what the local CLIProxyAPI pool did (requests, tokens, cache, plan limits) and its routing (strategy, account priority). `proxy.py` collects and reports |
 | `claude-picker` | Account, model and effort for Claude: a dialog when starting a Claude tab, a popup to switch model and effort live, or the account (restarts Claude with `--resume`, same conversation). Accounts in `accounts.json` |
 | `my-tabs` | Tabs, cloned from Herdr's `tabs`: per-panel widths, a Workflows panel button; its + opens `my-new-menu` |
 | `my-new-menu` | The + menu, cloned from Herdr's `new-menu`: Claude goes through `claude-picker` |
 | `my-pane` | Pane header, cloned from Herdr's `pane`: Claude panes show their account · model · effort, click to switch |
-| `my-spaces` | Spaces sidebar, cloned from Herdr's `spaces`: worktrees can be grouped (epics), in `data/my-spaces/groups.json` |
-| `my-spaces-group` | The popup that puts a worktree in a group |
+| `my-org` | Sidebar, per repository: the master, then each HQ manager with its worktrees and units, then workflow owners, then other spaces |
 
 Layout: `layouts/my-main.json`. Keys: `keys.json`.
 
 `shared/` holds what several mods use:
-- `claude.py`, `repos.py`: Claude sessions (every account's), terminals and repositories, imported by
+- `claude.py`, `repos.py`: Claude sessions (every account's), terminals and repositories; `masters.py`: finds each repo's master chat. Imported by
   `workflows/collect.py`, `master/master.py` and `claude-reader/read.py`.
 - `icons/`: the one-color icons the mods draw (`shared/icons/<name>.svg`).
 - `js/`: JavaScript several mods need. Mods can't import outside their own folder, so

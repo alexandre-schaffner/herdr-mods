@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@coldtea/pr-lens-renderer": "0.3.5",
+    "@coldtea/pr-lens-schema": "0.7.1",
+    "zod": "4.6.7"
+  }
+}

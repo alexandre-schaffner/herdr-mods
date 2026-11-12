@@ -7,7 +7,7 @@ import { div } from "gpui-kit";
 import { appHome, exec, notify } from "herdr";
 
 import { accounts, models, overview, requests, routingActions } from "./shared/proxy-views.js";
-import { alpha, btn, chip, icon, label, ok, row, scrollY, statusGlyph, TYPE } from "./ui.js";
+import { banner, btn, empty, icon, loading, mono, ok, scrollY, segmented, statusGlyph, timeAgo, toolbar, TYPE } from "./ui.js";
 
 const SHOWN_MS = 60_000;
 const BACKGROUND_MS = 5 * 60_000;
@@ -109,53 +109,35 @@ export class UsageView {
 
   /** For the status strip: is the proxy up, the fullest plan window (or extra-usage budget)
    *  across accounts, and the last 24 h request count when known. Null before the first report. */
+  /** Every plan window with a reading, fullest first: { who, label, pct, resets (epoch s) }.
+   *  Live subscription accounts in the pool only (an API key has no plan; a disabled account
+   *  isn't serving). The strip names the first; Home lists the top ones. */
+  windows() {
+    const out = [];
+    for (const a of this.data?.accounts ?? []) {
+      if (!a.live || a.kind === "api-key" || a.disabled) continue;
+      const who = a.label || a.email || a.name || "account";
+      const plan = a.plan ?? {};
+      for (const w of plan.windows ?? []) if (w.pct != null) out.push({ who, label: w.label, pct: w.pct, resets: w.resets ?? null });
+      if (plan.extra?.pct != null) out.push({ who, label: "extra usage", pct: plan.extra.pct, resets: null });
+    }
+    return out.sort((x, y) => y.pct - x.pct);
+  }
+
   summary() {
     const d = this.data;
     if (!d) return null;
-    let hottest = null;
-    for (const a of d.accounts ?? []) {
-      const name = a.label || a.email || a.name || "account";
-      const plan = a.plan ?? {};
-      const cands = [...(plan.windows ?? []).map(w => ({ label: `${name} · ${w.label}`, pct: w.pct, resets: w.resets ?? null }))];
-      if (plan.extra?.pct != null) cands.push({ label: `${name} · extra usage`, pct: plan.extra.pct, resets: null });
-      for (const c of cands) if (c.pct != null && (!hottest || c.pct > hottest.pct)) hottest = c;
-    }
-    return { up: !!d.proxy?.up, hottest, requests24h: this.requests24h };
+    const top = this.windows()[0];
+    return { up: !!d.proxy?.up, hottest: top ? { ...top, label: `${top.who} · ${top.label}` } : null, requests24h: this.requests24h };
   }
 
   // ---- drawing
 
-  segmented(t, id, items, value, pick) {
-    return h_flex()
-      .flex_none()
-      .p(2)
-      .gap(2)
-      .rounded(8)
-      .bg(alpha(t.foreground, 0.055))
-      .children(
-        items.map(x => {
-          const on = x.id === value;
-          return div()
-            .id(`${id}-${x.id}`)
-            .h(24)
-            .px(10)
-            .flex()
-            .items_center()
-            .rounded(6)
-            .text_size(TYPE.ui)
-            .cursor_pointer()
-            .when(on, el => el.bg(t.background).text_color(t.foreground).font_medium())
-            .when(!on, el => el.text_color(t.muted).hover(s => s.text_color(t.foreground)))
-            .on_click((_e, cx) => pick(x.id, cx))
-            .child(x.label);
-        }),
-      );
-  }
-
   toolbar(t) {
     const d = this.data;
     const up = d?.proxy?.up;
-    const state = !d ? (this.error ? "gone" : "idle") : up ? "done" : "gone";
+    // The proxy being up is a health check, not an agent's "done": a green check.
+    const mark = d && up ? icon("circle-check", 12, ok(t)) : statusGlyph(!d && !this.error ? "idle" : "gone", t, 12);
     const status = !d
       ? this.error
         ? "Couldn't reach the proxy report"
@@ -163,51 +145,28 @@ export class UsageView {
       : up
         ? "Proxy up on 127.0.0.1:8317"
         : `Proxy unreachable${d.proxy?.error ? `: ${d.proxy.error}` : ""}`;
-    const mins = this.updated ? Math.round((Date.now() - this.updated) / 60_000) : null;
-    return row()
-      .flex_none()
-      .items_center()
-      .gap(12)
-      .px(20)
-      .py(10)
-      .border_b(1)
-      .border_color(alpha(t.border, 0.8))
-      .child(this.segmented(t, "usage-tab", TABS, this.tab, (id, cx) => this.setTab(id, cx)))
-      .child(
-        h_flex()
-          .gap(6)
-          .items_center()
-          .min_w(0)
-          .child(state === "done" ? icon("circle-check", 12, ok(t)) : statusGlyph(state, t, 12))
-          .child(div().truncate().text_size(TYPE.meta).text_color(t.muted).child(status)),
-      )
-      .child(div().flex_1())
-      .child(
-        div()
-          .flex_none()
-          .text_size(TYPE.meta)
-          .text_color(t.dim)
-          .child(this.loading ? "Refreshing…" : mins == null ? "" : mins < 1 ? "Updated just now" : `Updated ${mins}m ago`),
-      )
-      .child(this.segmented(t, "usage-range", RANGES.map(r => ({ id: r, label: r === "all" ? "All" : r })), this.range, (r, cx) => this.setRange(r, cx)))
-      .child(btn(t, "usage-refresh", null, cx => this.refresh(cx), { kind: "ghost", size: "sm", icon: "repeat", tooltip: "Refresh (r) · [ ] switch view" }));
+    return toolbar(t, [
+      segmented(t, "usage-tab", TABS, this.tab, (id, cx) => this.setTab(id, cx)),
+      h_flex().gap(6).items_center().min_w(0).child(mark).child(div().truncate().text_size(TYPE.meta).text_color(t.muted).child(status)),
+      div().flex_1(),
+      this.loading ? div().flex_none().text_size(TYPE.meta).text_color(t.muted).child("Refreshing…") : timeAgo(t, this.updated, Date.now(), { verb: "Updated" }),
+      segmented(t, "usage-range", RANGES.map(r => ({ id: r, label: r === "all" ? "All" : r })), this.range, (r, cx) => this.setRange(r, cx)),
+      btn(t, "usage-refresh", null, cx => this.refresh(cx), { kind: "ghost", size: "sm", icon: "repeat", tooltip: "Refresh (r) · [ ] switch view" }),
+    ]);
   }
 
   body(t) {
     const d = this.data;
     if (!d)
-      return v_flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .gap(8)
-        .child(label(t, this.error ? "Couldn't load usage" : "Loading usage…"))
-        .when(!!this.error, el => el.child(div().max_w(560).text_size(TYPE.meta).text_color(t.dim).child(this.error)))
-        .when(!!this.error, el => el.child(btn(t, "usage-retry", "Retry", cx => this.refresh(cx), { size: "sm" })));
+      return this.error
+        ? empty(t, "Couldn't load usage", this.error, { icon: "alert", tone: t.blocked, action: btn(t, "usage-retry", "Retry", cx => this.refresh(cx), { size: "sm" }) })
+        : loading(t, "Loading usage…");
     const o = { goto: (tab, cx) => this.setTab(tab, cx), routing: (this.routing ??= routingActions(this, `${appHome()}/mods/proxy/proxy.py`, exec, notify)) };
+    // The shared views set numbers in `t.mono`: HQ's is Geist Mono.
+    const tv = { ...t, mono: mono() };
     const view =
-      this.tab === "models" ? models(t, d) : this.tab === "accounts" ? accounts(t, d) : this.tab === "requests" ? requests(t, d) : overview(t, d, o);
-    return scrollY(`usage-scroll-${this.tab}`, v_flex().px(20).py(16).gap(14).child(view));
+      this.tab === "models" ? models(tv, d) : this.tab === "accounts" ? accounts(tv, d, o) : this.tab === "requests" ? requests(tv, d) : overview(tv, d, o);
+    return scrollY(`usage-scroll-${this.tab}`, v_flex().px(24).py(24).child(view));
   }
 
   render(t, _cx) {
@@ -218,15 +177,7 @@ export class UsageView {
       .bg(t.surface ?? t.background)
       .child(this.toolbar(t))
       .when(!!this.error && !!this.data, el =>
-        el.child(
-          h_flex()
-            .px(20)
-            .py(6)
-            .gap(8)
-            .bg(alpha(t.blocked, 0.08))
-            .child(chip(t, "Last refresh failed", t.blocked))
-            .child(div().truncate().text_size(TYPE.meta).text_color(t.blocked).child(this.error)),
-        ),
+        el.child(banner(t, { tone: t.blocked, text: `The last refresh failed: ${this.error}`, action: btn(t, "usage-retry", "Retry", cx => this.refresh(cx), { size: "sm" }) })),
       )
       .child(this.body(t));
   }

@@ -5,7 +5,7 @@ import { Editor as CodeView, EditorState, h_flex, Input, InputState, v_flex } fr
 import { div } from "gpui-kit";
 import { home, readTextFile, settings as appSettings, writeTextFile } from "herdr";
 
-import { alpha, btn, chip, dot, frame, icon, label, mdBlock, mono, ok, row, scrollY, SP, tildify, TYPE, tint, tone } from "./ui.js";
+import { alpha, banner, btn, chip, dot, frame, icon, label, loading, mdBlock, mono, ok, row, scrollY, SP, tildify, tint, tone, TYPE } from "./ui.js";
 
 const DOCS = [
   {
@@ -14,6 +14,20 @@ const DOCS = [
     icon: "crown",
     applies: "When the master (re)starts",
     note: "Shared by every repository's master. A running master keeps the old text until it restarts, or until you tell it to re-read.",
+  },
+  {
+    id: "runner",
+    title: "Loop runner prompt",
+    icon: "repeat",
+    applies: "When the runner (re)starts",
+    note: "Shared by every repository. The cheap session (Haiku by default) that runs the master's tick and escalates judgment to it with `hq escalate`. Turn it off per repository with `runner: false` in settings.json.",
+  },
+  {
+    id: "style",
+    title: "Communication style",
+    icon: "message",
+    applies: "Within one tick",
+    note: "Shared by every repository: how the master, managers, units and workflow owners write (general messages: bro; observability: ASD-STE100; handovers: BLUF + SBAR). Briefs carry it at launch; `hq tick` flags a change.",
   },
   {
     id: "orders",
@@ -37,6 +51,13 @@ const DOCS = [
     note: "Every manager's brief is this plus its charter and team. Placeholders: {repo} {repo_dir} {id} {master} {label} {policy}.",
   },
   {
+    id: "owner",
+    title: "Workflow owner brief",
+    icon: "flow-down",
+    applies: "At the next owner's launch",
+    note: "What each workflow run's owner session is told. Placeholders: {name} {repo} {id} {master} {policy} {folder} {call} {note}; double the braces of literal ones ({{ }}).",
+  },
+  {
     id: "handoff",
     title: "Master handoff",
     icon: "file-text",
@@ -53,11 +74,13 @@ const NUMBERS = [
   { key: "quietMinutes", label: "Quiet after", unit: "min", hint: "A working session with no transcript write for this long is flagged as quiet." },
   { key: "idleMinutes", label: "Idle after", unit: "min", hint: "A manager idle this long raises an info signal." },
   { key: "dreamEvery", label: "Dream every", unit: "commits", hint: "Memory commits since the last Dream before the master is told to dream." },
+  { key: "unitIdleMinutes", label: "End idle units after", unit: "min", hint: "A manager's unit session that finished and sat idle this long is ended (its worktree, commits and report stay). Pinned units, and ones labelled herdr.hq.keep, stay." },
 ];
 
 const TOGGLES = [
   { key: "autoRearm", label: "Keep the master's loop armed", hint: "Types `/loop master tick` back in when the loop lapses and the master is idle." },
   { key: "autoCompactMaster", label: "Compact the master when idle and large", hint: "Runs /compact on an idle master over the threshold below." },
+  { key: "freeUnits", label: "End finished unit sessions", hint: "Ends managers' unit sessions left idle past the time below, so they stop holding memory and tabs." },
 ];
 
 export class PromptsView {
@@ -358,7 +381,7 @@ export class PromptsView {
                     .child(div().text_size(12.5).font_medium().text_color(on ? t.foreground : t.muted).truncate().child(d.title))
                     .when(!!dirty, el => el.child(dot(tone(t).warn, 6))),
                 )
-                .child(div().text_size(10.5).text_color(t.dim).truncate().child(d.applies)),
+                .child(div().text_size(10.5).text_color(t.muted).truncate().child(d.applies)),
             );
         }),
       );
@@ -445,7 +468,7 @@ export class PromptsView {
                   .truncate()
                   .text_size(TYPE.meta)
                   .font_family(mono())
-                  .text_color(t.dim)
+                  .text_color(t.muted)
                   .tooltip(path ?? "")
                   .child(tildify(path, home()) || ""),
               ),
@@ -453,25 +476,21 @@ export class PromptsView {
       )
       .when(doc.stale, el =>
         el.child(
-          this.banner(
-            t,
-            tone(t).warn,
-            "alert",
-            "This file changed on disk since you opened it.",
-            btn(t, `reload-${d.id}`, "Reload (drop my edits)", cx => this.reload(doc, cx), { size: "sm" }),
-          ),
+          banner(t, {
+            tone: tone(t).warn,
+            text: "This file changed on disk since you opened it.",
+            action: btn(t, `reload-${d.id}`, "Reload (drop my edits)", cx => this.reload(doc, cx), { size: "sm" }),
+          }),
         ),
       )
       .when(!!doc.tellPending && d.id === "master", el =>
         el.child(
-          this.banner(
-            t,
-            t.accent,
-            "send",
-            this.app.data?.master?.terminal
+          banner(t, {
+            icon: "send",
+            text: this.app.data?.master?.terminal
               ? `Saved. The running master (${this.app.data.master.terminal}) still has the old prompt.`
               : "Saved. It applies when the master next starts.",
-            this.app.data?.master?.terminal
+            action: this.app.data?.master?.terminal
               ? btn(t, "tell-master", this.app.isBusy("tell-master") ? "Telling…" : "Tell the master", cx => this.tellMaster(doc, cx), {
                   kind: "primary",
                   size: "sm",
@@ -479,13 +498,13 @@ export class PromptsView {
                   disabled: this.app.isBusy("tell-master"),
                 })
               : null,
-          ),
+          }),
         ),
       )
-      .when(!!doc.error, el => el.child(this.banner(t, t.blocked, "x", doc.error, null)))
+      .when(!!doc.error, el => el.child(banner(t, { tone: t.blocked, icon: "x", text: doc.error })))
       .child(
         !doc.loaded
-          ? div().p(SP.xl).text_size(TYPE.ui).text_color(t.dim).child(path ? "Reading…" : "Waiting for HQ's first snapshot…")
+          ? loading(t, path ? "Reading…" : "Waiting for HQ's first snapshot…")
           : edit
             ? div()
                 .flex_1()
@@ -518,23 +537,6 @@ export class PromptsView {
                   ),
                 ),
       );
-  }
-
-  banner(t, color, ic, text, action) {
-    return h_flex()
-      .mx(12)
-      .mt(10)
-      .px(10)
-      .py(7)
-      .gap(8)
-      .items_center()
-      .rounded(8)
-      .bg(alpha(color, 0.12))
-      .border(1)
-      .border_color(alpha(color, 0.35))
-      .child(icon(ic, 13, color))
-      .child(div().flex_1().min_w(0).text_size(12).text_color(t.foreground).child(text))
-      .when(!!action, el => el.child(action));
   }
 
   autopilot(t) {
@@ -570,7 +572,7 @@ export class PromptsView {
                 }),
               ),
           )
-          .child(div().text_size(11).font_family(mono()).text_color(t.dim).child(tildify(this.path("settings"), home()) || "—"))
+          .child(div().text_size(11).font_family(mono()).text_color(t.muted).child(tildify(this.path("settings"), home()) || "—"))
           .child(
             div()
               .text_size(11.5)
@@ -578,7 +580,7 @@ export class PromptsView {
               .child("Chores HQ does by itself while it's open, once a minute. They remove typing, never a decision."),
           ),
       )
-      .when(!!f.error, el => el.child(this.banner(t, t.blocked, "x", f.error, null)))
+      .when(!!f.error, el => el.child(banner(t, { tone: t.blocked, icon: "x", text: f.error }).mx(0).mt(0)))
       .child(
         v_flex()
           .gap(12)
@@ -606,7 +608,7 @@ export class PromptsView {
                     .min_w(0)
                     .gap(2)
                     .child(div().text_size(12.5).text_color(t.foreground).child(n.label))
-                    .child(div().text_size(11).text_color(t.dim).child(n.hint)),
+                    .child(div().text_size(11).text_color(t.muted).child(n.hint)),
                 )
                 .child(
                   h_flex()
@@ -614,7 +616,7 @@ export class PromptsView {
                     .gap(6)
                     .items_center()
                     .child(div().w(110).child(frame(t, Input.new(f.inputs[n.key]), this.focus === `num:${n.key}`, { mono: true })))
-                    .child(div().w(50).text_size(11).text_color(t.dim).child(n.unit)),
+                    .child(div().w(50).text_size(11).text_color(t.muted).child(n.unit)),
                 ),
             ),
           ),
@@ -657,7 +659,7 @@ export class PromptsView {
           .gap(2)
           .min_w(0)
           .child(div().text_size(12.5).text_color(t.foreground).child(text))
-          .child(div().text_size(11).text_color(t.dim).child(hint)),
+          .child(div().text_size(11).text_color(t.muted).child(hint)),
       );
   }
 }

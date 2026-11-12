@@ -6,7 +6,7 @@ import { Editor, EditorState, h_flex, Input, InputState, Textarea, TextareaState
 import { div } from "gpui-kit";
 import { appHome, exec, home, readTextFile, settings, writeTextFile } from "herdr";
 
-import { ago, alpha, btn, chip, clip, empty, frame, icon, inTime, label, meter, mono, pageHeader, pane, plain, row, scrollY, section, shortModel, SP, statusGlyph, statusLook, tildify, TYPE, listRow, mdBlock, tint } from "./ui.js";
+import { agentMark, ago, alpha, banner, btn, chip, clip, ctxLimits, drawer, empty, facts, frame, icon, inTime, lines, linkBtn, loading, mdBlock, meter, mono, pageHeader, pane, plain, row, scrollY, section, sectionHead, segmented, shortModel, SP, statusBadge, statusGlyph, tildify, timeAgo, tint, TYPE } from "./ui.js";
 
 const FIELDS = [
   { key: "name", label: "Name", placeholder: "Hooks" },
@@ -21,8 +21,6 @@ export class OrgView {
     this.app = app;
     this.sel = null; // null (just the roster) | "master" | manager id | "new" | "discover"
     this.showRetired = false;
-    this.mapZoom = "actual"; // "actual" (1:1, scroll) | "fit"
-    this.mapW = 0;
     this.focusKey = null;
     this.f = {};
     for (const d of [...FIELDS, { key: "id" }]) {
@@ -179,7 +177,7 @@ export class OrgView {
 
   /** The formal view: the roster as a table, full width; a row opens its page in a drawer. */
   render(t, cx) {
-    const open = this.sel && this.sel !== "map";
+    const open = !!this.sel;
     const wide = this.sel === "new" || this.sel === "discover";
     return row()
       .flex_1()
@@ -188,25 +186,13 @@ export class OrgView {
       .child(this.rosterTable(t))
       .when(!!open, el =>
         el.child(
-          v_flex()
-            .flex_none()
-            .w(wide ? 680 : 620)
-            .min_h(0)
-            .border_l(1)
-            .border_color(t.border)
-            .bg(t.background)
-            .child(
-              row()
-                .flex_none()
-                .h(36)
-                .px(SP.md)
-                .items_center()
-                .border_b(1)
-                .border_color(alpha(t.border, 0.6))
-                .child(div().flex_1().text_size(TYPE.meta).text_color(t.muted).child(this.sel === "new" ? "New manager" : this.sel === "discover" ? "Adopt sessions" : "Manager"))
-                .child(btn(t, "org-drawer-close", null, cx => ((this.sel = null), cx.notify()), { kind: "ghost", size: "sm", icon: "x", tooltip: "Close (Esc)" })),
-            )
-            .child(v_flex().flex_1().min_h(0).child(this.detail(t))),
+          drawer(t, {
+            id: "org-drawer",
+            title: this.sel === "new" ? "New manager" : this.sel === "discover" ? "Adopt sessions" : "Manager",
+            width: wide ? 680 : 600,
+            onClose: cx => ((this.sel = null), cx.notify()),
+            body: this.detail(t),
+          }),
         ),
       );
   }
@@ -223,7 +209,7 @@ export class OrgView {
     const count = st => live.filter(m => (m.live ? m.status : "gone") === st).length;
     const narrow = !!this.sel;
     const cols = narrow
-      ? [["Status", 116], ["Manager", 0], ["Context", 96]]
+      ? [["Status", 88], ["Manager", 0], ["Context", 72]]
       : [["Status", 116], ["Manager", 0], ["Now", 0], ["Team", 64], ["Context", 112], ["Session", 128], ["", 104]];
     const header = row()
       .flex_none()
@@ -238,6 +224,7 @@ export class OrgView {
           div()
             .when(!!w, el => el.w(w).flex_none())
             .when(!w, el => el.flex_1().min_w(0))
+            .when(narrow && name === "Context", el => el.text_right())
             .text_size(TYPE.meta)
             .font_semibold()
             .text_color(t.muted)
@@ -246,19 +233,7 @@ export class OrgView {
       );
     const group = (title, items, o = {}) =>
       v_flex()
-        .child(
-          row()
-            .id(`org-group-${title}`)
-            .px(SP.xl)
-            .pt(SP.lg)
-            .pb(6)
-            .gap(SP.sm)
-            .items_center()
-            .when(!!o.toggle, el => el.cursor_pointer().on_click((_e, cx) => o.toggle(cx)))
-            .when(!!o.toggle, el => el.child(icon(o.open ? "chevron-down" : "chevron-right", 11, t.muted)))
-            .child(div().text_size(TYPE.ui).font_semibold().text_color(t.foreground).child(title))
-            .child(div().text_size(TYPE.meta).text_color(t.muted).child(String(items.length))),
-        )
+        .child(div().px(SP.xl).pt(SP.lg).pb(6).child(sectionHead(t, { id: `org-group-${title}`, level: "group", title, count: items.length, open: o.open, onToggle: o.toggle })))
         .when(o.open !== false, el => el.children(items));
     const m = d.master;
     return v_flex()
@@ -268,6 +243,7 @@ export class OrgView {
       .child(
         row()
           .flex_none()
+          .flex_wrap()
           .px(SP.xl)
           .py(SP.md)
           .gap(SP.md)
@@ -277,7 +253,7 @@ export class OrgView {
           .child(
             v_flex()
               .flex_1()
-              .min_w(0)
+              .min_w(260)
               .gap(2)
               .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("Org"))
               .child(
@@ -289,10 +265,17 @@ export class OrgView {
                   ),
               ),
           )
-          .child(btn(t, "org-policy", "Approval policy", cx => this.app.go("prompts", cx, { id: "policy" }), { kind: "ghost", size: "sm" }))
-          .child(btn(t, "org-template", "Brief template", cx => this.app.go("prompts", cx, { id: "base" }), { kind: "ghost", size: "sm" }))
-          .child(btn(t, "org-adopt", "Adopt sessions", cx => this.select("discover", cx), { size: "sm", icon: "search" }))
-          .child(btn(t, "org-new", "New manager", cx => this.select("new", cx), { kind: "primary", size: "sm", icon: "plus" })),
+          .child(
+            h_flex()
+              .min_w(0)
+              .flex_wrap()
+              .gap(SP.sm)
+              .items_center()
+              .child(btn(t, "org-policy", "Approval policy", cx => this.app.go("prompts", cx, { id: "policy" }), { kind: "ghost", size: "sm" }))
+              .child(btn(t, "org-template", "Brief template", cx => this.app.go("prompts", cx, { id: "base" }), { kind: "ghost", size: "sm" }))
+              .child(btn(t, "org-adopt", "Adopt sessions", cx => this.select("discover", cx), { size: "sm", icon: "search" }))
+              .child(btn(t, "org-new", "New manager", cx => this.select("new", cx), { kind: "primary", size: "sm", icon: "plus" })),
+          ),
       )
       .child(header)
       .child(
@@ -305,13 +288,13 @@ export class OrgView {
                 this.rosterRow(t, cols, {
                   id: "master",
                   name: "Master",
-                  lead: icon("crown", 12, t.accent),
+                  lead: agentMark(t, { kind: "master" }),
                   area: "Coordinates the org, runs the merge queue's batches past you",
                   status: m.terminal ? m.status : "gone",
                   facts: m.facts,
                   team: (m.team ?? []).filter(x => !x.finished).length,
                   ctx: m.facts?.context,
-                  warn: d.settings.masterCompactAt * 0.7,
+                  lim: ctxLimits(d.settings, "master"),
                   terminal: m.terminal,
                 }),
               ]),
@@ -338,13 +321,13 @@ export class OrgView {
     return this.rosterRow(t, cols, {
       id: x.id,
       name: x.name || x.id,
-      lead: x.kind === "merge-queue" ? icon("git-branch", 12, t.accent) : null,
+      lead: agentMark(t, { kind: x.kind }),
       area: x.area,
       status: x.status === "retired" ? "retired" : x.live ? x.status : "gone",
       facts: x.facts,
       team: (x.team ?? []).filter(u => !u.finished).length,
       ctx: x.facts?.context,
-      warn: d.settings.managerWarnAt,
+      lim: ctxLimits(d.settings, "manager"),
       terminal: x.terminal,
       manager: x,
     });
@@ -352,7 +335,6 @@ export class OrgView {
 
   rosterRow(t, cols, r) {
     const d = this.app.data;
-    const st = statusLook(r.status, t);
     const f = r.facts ?? {};
     const now = plain(r.status === "working" ? f.doing || f.said : f.said || f.doing) || "";
     const on = this.sel === r.id;
@@ -369,19 +351,9 @@ export class OrgView {
       .border_color(alpha(t.border, 0.4))
       .cursor_pointer()
       .when(on, el => el.bg(tint(t).on))
-      .hover(s => s.bg(tint(t).hover))
+      .when(!on, el => el.hover(s => s.bg(tint(t).hover)))
       .on_click((_e, cx) => (this.sel === r.id ? ((this.sel = null), cx.notify()) : this.select(r.id, cx)))
-      .child(
-        cell(
-          116,
-          h_flex()
-            .pt(2)
-            .gap(7)
-            .items_center()
-            .child(statusGlyph(r.status, t, 12))
-            .child(div().text_size(TYPE.ui).text_color(r.status === "blocked" || r.status === "gone" ? t.blocked : t.foreground).child(st.label)),
-        ),
-      )
+      .child(cell(cols[0][1], div().pt(2).child(statusBadge(t, r.status, { still: this.app.palette?.open }))))
       .child(
         cell(
           0,
@@ -389,13 +361,16 @@ export class OrgView {
             .gap(2)
             .child(
               h_flex()
+                .min_w(0)
                 .gap(6)
                 .items_center()
                 .when(!!r.lead, el => el.child(r.lead))
-                .child(div().text_size(TYPE.body).font_semibold().text_color(t.foreground).child(r.name))
-                .when(r.id !== "master", el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(r.id))),
+                .child(div().flex_none().text_size(TYPE.body).font_semibold().text_color(t.foreground).child(r.name))
+                .when(r.id !== "master", el => el.child(div().min_w(0).truncate().text_size(TYPE.meta).text_color(t.muted).child(r.id)))
+                .when(narrow, el => el.child(div().flex_1()).child(div().flex_none().child(meter(t, r.ctx, r.lim, { w: 40 })))),
             )
-            .when(!!r.area, el => el.child(div().text_size(TYPE.ui).line_height(1.4).text_color(t.muted).child(clip(r.area, narrow ? 90 : 140)))),
+            .when(!!r.area && narrow, el => el.child(lines(r.area, TYPE.ui, 2, 34, 1.4).text_color(t.muted)))
+            .when(!!r.area && !narrow, el => el.child(div().text_size(TYPE.ui).line_height(1.4).text_color(t.muted).child(clip(r.area, 140)))),
         ),
       )
       .when(!narrow, el =>
@@ -403,7 +378,7 @@ export class OrgView {
           .child(cell(0, div().pt(1).text_size(TYPE.ui).line_height(1.4).text_color(t.foreground).child(clip(now, 150) || "—")))
           .child(cell(64, div().pt(1).text_size(TYPE.ui).text_color(r.team ? t.foreground : t.muted).child(r.team ? String(r.team) : "—"))),
       )
-      .child(cell(narrow ? 96 : 112, div().pt(4).child(meter(t, r.ctx, r.warn, { w: narrow ? 40 : 56 }))))
+      .when(!narrow, el => el.child(cell(112, div().pt(4).child(meter(t, r.ctx, r.lim, { w: 56 })))))
       .when(!narrow, el =>
         el
           .child(
@@ -412,7 +387,7 @@ export class OrgView {
               v_flex()
                 .gap(1)
                 .child(div().text_size(TYPE.ui).font_family(mono()).text_color(t.foreground).child(r.terminal ?? "—"))
-                .child(div().text_size(TYPE.meta).text_color(t.muted).child(f.lastAt ? `active ${ago(f.lastAt, d.now)}` : "")),
+                .child(timeAgo(t, f.lastAt, d.now, { verb: "active" })),
             ),
           )
           .child(
@@ -470,44 +445,22 @@ export class OrgView {
             row()
               .gap(SP.sm)
               .items_start()
-              .child(div().pt(3).child(statusGlyph("working", t, 12)))
+              .child(div().pt(3).child(statusGlyph("working", t, 12, { still: this.app.palette?.open })))
               .child(div().flex_1().min_w(0).text_size(TYPE.body).font_medium().line_height(1.45).text_color(t.foreground).child(doing)),
           ),
         )
-        .when(!!said, el => el.child(div().text_size(TYPE.body).line_height(1.55).text_color(doing ? t.muted : t.foreground).child(clipWords(said, 600))))
+        .when(!!said, el => el.child(div().text_size(TYPE.body).line_height(1.55).text_color(doing ? t.muted : t.foreground).child(clip(said, 600))))
         .when(!doing && !said, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child("No transcript found for this session."))),
       { hint: f.lastAt ? `last activity ${ago(f.lastAt, now)}` : null },
     );
   }
 
-  /** Label/value rows whose values may be elements (meters, links). */
-  factRows(t, rows) {
-    return v_flex()
-      .gap(SP.sm)
-      .children(
-        rows
-          .filter(r => r && r[1] != null && r[1] !== "")
-          .map(([k, v, o = {}]) =>
-            row()
-              .gap(SP.md)
-              .items_start()
-              .when(!!o.tip, el => el.id(`fact-${k}`).tooltip(o.tip))
-              .child(div().w(104).flex_none().pt(1).text_size(TYPE.ui).text_color(t.muted).child(k))
-              .child(
-                typeof v === "string" || typeof v === "number"
-                  ? div().flex_1().min_w(0).text_size(TYPE.ui).line_height(1.45).text_color(t.foreground).when(!!o.mono, el => el.font_family(mono())).child(String(v))
-                  : div().flex_1().min_w(0).child(v),
-              ),
-          ),
-      );
-  }
-
-  ctxValue(t, value, warnAt, note) {
+  ctxValue(t, value, lim, note) {
     return h_flex()
       .gap(SP.sm)
       .items_center()
       .flex_wrap()
-      .child(meter(t, value, warnAt, { w: 96 }))
+      .child(meter(t, value, lim, { w: 96 }))
       .when(!!note, el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(note)));
   }
 
@@ -525,21 +478,20 @@ export class OrgView {
         .when(done.length > 0, el =>
           el
             .child(
-              h_flex()
-                .id(`org-done-${this.sel}`)
+              div()
                 .pt(SP.sm)
-                .gap(5)
-                .items_center()
-                .cursor_pointer()
-                .text_size(TYPE.ui)
-                .text_color(t.muted)
-                .hover(s => s.text_color(t.foreground))
-                .on_click((_e, cx) => {
-                  showDone ? this.expanded.delete(`done-${this.sel}`) : this.expanded.add(`done-${this.sel}`);
-                  cx.notify();
-                })
-                .child(icon(showDone ? "chevron-down" : "chevron-right", 11, t.muted))
-                .child(`${done.length} finished in the last day`),
+                .child(
+                  linkBtn(
+                    t,
+                    `org-done-${this.sel}`,
+                    `${done.length} finished in the last day`,
+                    cx => {
+                      showDone ? this.expanded.delete(`done-${this.sel}`) : this.expanded.add(`done-${this.sel}`);
+                      cx.notify();
+                    },
+                    { chevron: showDone },
+                  ),
+                ),
             )
             .when(showDone, el => el.children(done.slice(0, 12).map(x => this.teamRow(t, x)))),
         ),
@@ -566,7 +518,7 @@ export class OrgView {
           .tooltip(`${x.terminal}: click to peek, double-click to go there`)
           .on_click((e, _cx) => (e.click_count > 1 ? this.app.focusTerminal(x.terminal) : this.app.peek(x.terminal))),
       )
-      .child(div().pt(3).child(statusGlyph(status, t, 11)))
+      .child(div().pt(3).child(statusGlyph(status, t, 11, { still: this.app.palette?.open })))
       .child(icon(ic, 12, t.muted))
       .child(
         v_flex()
@@ -576,41 +528,19 @@ export class OrgView {
           .child(div().text_size(TYPE.ui).line_height(1.4).text_color(x.finished ? t.muted : t.foreground).child(clip(x.description ?? x.id, 140)))
           .child(div().text_size(TYPE.meta).text_color(t.muted).child(what)),
       )
-      .child(div().flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(unit ? (x.terminal ?? "") : ago(x.lastAt, this.app.data.now)));
+      .child(unit ? div().flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(x.terminal ?? "") : timeAgo(t, x.lastAt, this.app.data.now).pt(1));
   }
 
   /** "Overview | Charter and team" inside a manager page: reading first, editing one click away. */
   tabs(t) {
     const opts = [
       { id: "overview", label: "Overview" },
-      { id: "edit", label: "Charter and team" },
+      { id: "edit", label: `Charter and team${this.dirty ? " •" : ""}` },
     ];
-    const cur = this.tab ?? "overview";
-    return h_flex()
-      .flex_none()
-      .p(3)
-      .gap(2)
-      .rounded(8)
-      .bg(alpha(t.foreground, 0.055))
-      .children(
-        opts.map(o =>
-          h_flex()
-            .id(`org-tab-${o.id}`)
-            .h(26)
-            .px(SP.md)
-            .items_center()
-            .rounded(6)
-            .cursor_pointer()
-            .text_size(TYPE.ui)
-            .when(cur === o.id, el => el.bg(t.background).font_medium().text_color(t.foreground).shadow_sm())
-            .when(cur !== o.id, el => el.text_color(t.muted).hover(s => s.text_color(t.foreground)))
-            .on_click((_e, cx) => {
-              this.tab = o.id;
-              cx.notify();
-            })
-            .child(o.label + (o.id === "edit" && this.dirty ? " •" : "")),
-        ),
-      );
+    return segmented(t, "org-tab", opts, this.tab ?? "overview", (id, cx) => {
+      this.tab = id;
+      cx.notify();
+    });
   }
 
   // ---- the master
@@ -619,22 +549,21 @@ export class OrgView {
     const d = this.app.data;
     const m = d.master;
     const f = m.facts ?? {};
-    const loop = f.loop;
-    const loopOn = loop && !loop.stopped && loop.wakeAt;
-    const overdue = loopOn && d.now > loop.wakeAt + 3 * 60_000;
+    const loop = m.loop ?? {};
+    const loopOn = ["running", "waiting", "overdue"].includes(loop.state);
+    const overdue = loop.state === "overdue";
     const term = m.terminal;
     const status = term ? m.status : "gone";
-    const st = statusLook(status, t);
     const idle = m.status === "idle" || m.status === "done";
+    const lim = ctxLimits(d.settings, "master");
     return pane(
       "org-detail-master",
       v_flex()
         .gap(SP.xl)
         .child(
           pageHeader(t, {
-            glyph: statusGlyph(status, t, 16),
             title: "Master",
-            chips: [chip(t, st.label, st.color), chip(t, "perpetual", t.accent, { icon: "repeat" })],
+            chips: [statusBadge(t, status, { size: 13, still: this.app.palette?.open }), chip(t, "perpetual", t.accent, { icon: "repeat" })],
             meta: `Coordinates every manager in ${d.repo.name}. It runs a tick on its own schedule and files what needs you in Review.`,
             actions: term
               ? [
@@ -651,7 +580,7 @@ export class OrgView {
             section(
               t,
               "Session",
-              this.factRows(t, [
+              facts(t, [
                 [
                   "Loop",
                   h_flex()
@@ -662,7 +591,7 @@ export class OrgView {
                       div()
                         .text_size(TYPE.ui)
                         .text_color(loopOn && !overdue ? t.foreground : t.blocked)
-                        .child(loopOn ? (overdue ? `Tick overdue by ${inTime(loop.wakeAt, d.now).replace(" overdue", "")}` : `Next tick ${inTime(loop.wakeAt, d.now)}`) : loop?.stopped ? "Stopped by the master" : "Not armed"),
+                        .child(loopOn ? (overdue ? `Tick overdue by ${inTime(loop.wakeAt, d.now).replace(" overdue", "")}` : loop.wakeAt ? `Next tick ${inTime(loop.wakeAt, d.now)}` : "Ticking now") : loop.state === "stopped" ? "Stopped by the master" : "Not armed"),
                     )
                     .when(!loopOn || overdue, el =>
                       el.child(btn(t, "m-arm", this.app.isBusy("loop") ? "Arming…" : "Arm the loop", cx => this.app.doAction("loop-arm", "master", term, cx), { size: "sm", disabled: this.app.isBusy("loop") || !idle, tooltip: idle ? "Types /loop master tick" : "Once the master is idle" })),
@@ -675,7 +604,7 @@ export class OrgView {
                     .gap(SP.sm)
                     .items_center()
                     .flex_wrap()
-                    .child(this.ctxValue(t, f.context, d.settings.masterCompactAt * 0.7, d.settings.autoCompactMaster ? `auto-compacts when idle above ${Math.round(d.settings.masterCompactAt / 1000)}k` : "auto-compaction off"))
+                    .child(this.ctxValue(t, f.context, lim, d.settings.autoCompactMaster ? `auto-compacts when idle above ${Math.round(d.settings.masterCompactAt / 1000)}k` : "auto-compaction off"))
                     .child(btn(t, "m-compact", "Compact now", cx => this.app.doAction("compact", "master", term, cx), { size: "sm", kind: "ghost", disabled: !idle || this.app.isBusy(`compact-${term}`), tooltip: idle ? "Types /compact" : "Only when the master is idle" })),
                 ],
                 ["Compacted", f.compactedAt ? ago(f.compactedAt, d.now) : null],
@@ -698,8 +627,8 @@ export class OrgView {
     const term = m.terminal;
     const retired = m.status === "retired";
     const status = m.live ? m.status : retired ? "retired" : "gone";
-    const st = statusLook(status, t);
     const idle = m.status === "idle" || m.status === "done";
+    const lim = ctxLimits(d.settings, "manager");
     const busy = k => this.app.isBusy(`${k}-${m.id}`);
     const editing = (this.tab ?? "overview") === "edit";
     const actions = retired
@@ -724,9 +653,8 @@ export class OrgView {
           ]
         : [btn(t, "mg-launch", busy("launch") ? "Launching…" : "Launch", cx => this.app.act(cx, `launch-${m.id}`, ["manager-launch", m.id], { done: `Launched ${m.id}`, fail: "Couldn't launch" }), { kind: "primary", icon: "play", disabled: busy("launch") })];
     const header = pageHeader(t, {
-      glyph: statusGlyph(status, t, 16),
       title: m.name || m.id,
-      chips: [chip(t, st.label, st.color), chip(t, m.kind === "merge-queue" ? "merge queue" : "area", t.accent, { icon: m.kind === "merge-queue" ? "git-branch" : "layers" })],
+      chips: [statusBadge(t, status, { size: 13, still: this.app.palette?.open }), chip(t, m.kind === "merge-queue" ? "merge queue" : "area", t.accent, { icon: m.kind === "merge-queue" ? "git-branch" : "layers" })],
       meta: m.area || null,
       actions,
     });
@@ -739,8 +667,8 @@ export class OrgView {
         section(
           t,
           "Session",
-          this.factRows(t, [
-            ["Context", m.live ? this.ctxValue(t, f.context, d.settings.managerWarnAt, (f.context ?? 0) > d.settings.managerWarnAt ? "large: compact or respawn when idle" : null) : null],
+          facts(t, [
+            ["Context", m.live ? this.ctxValue(t, f.context, lim, (f.context ?? 0) > lim.warn ? "large: compact or respawn when idle" : null) : null],
             ["Model", f.model ? shortModel(f.model) : null],
             ["Terminal", term ? `${term}${m.where ? ` · ${m.where}` : ""}` : null],
             ["Worktree", m.worktree ? tildify(m.worktree, home()) : null, { mono: true }],
@@ -780,19 +708,16 @@ export class OrgView {
             .child(div().text_size(TYPE.body).line_height(1.55).child(TextView.markdown(`handoff-${m.id}-${open ? 1 : 0}`, shown)))
             .when(long, el =>
               el.child(
-                h_flex()
-                  .id(`handoff-more-${m.id}`)
-                  .gap(5)
-                  .items_center()
-                  .cursor_pointer()
-                  .text_size(TYPE.ui)
-                  .text_color(t.accent)
-                  .on_click((_e, cx) => {
+                linkBtn(
+                  t,
+                  `handoff-more-${m.id}`,
+                  open ? "Show less" : "Show the whole handoff",
+                  cx => {
                     open ? this.expanded.delete(`handoff-${m.id}`) : this.expanded.add(`handoff-${m.id}`);
                     cx.notify();
-                  })
-                  .child(icon(open ? "chevron-down" : "chevron-right", 11, t.accent))
-                  .child(open ? "Show less" : "Show the whole handoff"),
+                  },
+                  { chevron: open },
+                ),
               ),
             )
         : div().text_size(TYPE.ui).text_color(t.muted).child("Its report has no ## Handoff section yet."),
@@ -881,7 +806,7 @@ export class OrgView {
           "mg-retire",
           this.confirm === "retire" ? "Confirm retire" : "Retire",
           cx => this.armed(cx, "retire", () => this.app.act(cx, `retire-${m.id}`, ["manager-retire", m.id], { done: `Retired ${m.id}` })),
-          { size: "sm", kind: this.confirm === "retire" ? "danger" : "ghost", tooltip: "Takes it out of the org; its session keeps running until you close it" },
+          { size: "sm", kind: this.confirm === "retire" ? "danger" : "ghost", tooltip: "Takes it out of the org. Its session and its units end once they have sat idle for the time set in Prompts > Autopilot" },
         ),
       )
       .child(btn(t, "mg-save", busy ? "Saving…" : "Save changes", cx => this.saveManager(cx, false), { kind: "primary", size: "sm", disabled: busy || !this.dirty }));
@@ -986,9 +911,9 @@ export class OrgView {
             meta: "Claude sessions in this repo's worktrees that aren't in the org yet. Adopting keeps the session running as it is; HQ starts tracking it as a manager.",
           }),
         )
-        .when(!!this.error, el => el.child(div().text_size(TYPE.ui).text_color(t.blocked).child(this.error)))
-        .when(c == null, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child("Looking for sessions…")))
-        .when(c != null && c.length === 0, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child("Every running session is already in the org.")))
+        .when(!!this.error, el => el.child(banner(t, { tone: t.blocked, text: this.error }).mx(0).mt(0)))
+        .when(c == null, el => el.child(loading(t, "Looking for sessions…")))
+        .when(c != null && c.length === 0, el => el.child(empty(t, "Nothing to adopt", "Every running session in this repo's worktrees is already in the org.", { icon: "circle-check" })))
         .child(
           v_flex()
             .gap(2)
@@ -1004,7 +929,7 @@ export class OrgView {
                   .rounded(8)
                   .border_b(1)
                   .border_color(alpha(t.border, 0.6))
-                  .child(div().pt(3).child(statusGlyph(x.status, t, 13)))
+                  .child(div().pt(3).child(statusGlyph(x.status, t, 13, { still: this.app.palette?.open })))
                   .child(
                     v_flex()
                       .flex_1()
@@ -1050,13 +975,6 @@ export class OrgView {
         ),
     );
   }
-}
-
-/** Clips at a word boundary (clip() cuts mid-word), for longer prose. */
-function clipWords(text, n) {
-  const s = plain(text);
-  if (s.length <= n) return s;
-  return s.slice(0, n).replace(/\s+\S*$/, "") + "…";
 }
 
 const DEFAULT_ROSTER = [

@@ -6,7 +6,7 @@ import { h_flex, Input, InputState, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 
 import { openLink } from "./shared/viewer-link.js";
-import { ago, alpha, btn, chip, clip, frame, icon, kbd, ok, plain, row, scrollY, SP, statusGlyph, TYPE } from "./ui.js";
+import { ago, alpha, btn, chip, clip, empty, frame, icon, kbd, ok, plain, row, scrollY, sectionHead, SP, statusGlyph, TYPE } from "./ui.js";
 
 const GROUPS = [
   { id: "doing", title: "In progress" },
@@ -125,30 +125,14 @@ export class TodoView {
                   .child(kbd(t, "]")).child(div().text_size(TYPE.meta).text_color(t.muted).child("reorder"))
                   .child(div().w(6)).child(kbd(t, "N")).child(div().text_size(TYPE.meta).text_color(t.muted).child("note"))),
             )
-            .when(live.length === 0, el =>
-              el.child(
-                v_flex()
-                  .py(SP.xxl)
-                  .items_center()
-                  .gap(SP.sm)
-                  .child(icon("list", 22, t.muted))
-                  .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("No next moves yet"))
-                  .child(div().max_w(460).text_center().text_size(TYPE.ui).text_color(t.muted).child("The master adds them in its tick. Ask it in Chat if you want the plan now.")),
-              ),
-            )
+            .when(live.length === 0, el => el.child(empty(t, "No next moves yet", "The master adds them in its tick. Ask it in Chat if you want the plan now.", { icon: "list" })))
             .children(
               GROUPS.map(g => {
                 const items = all.filter(x => x.status === g.id);
                 if (!items.length) return div();
                 return v_flex()
                   .gap(6)
-                  .child(
-                    h_flex()
-                      .gap(SP.sm)
-                      .items_center()
-                      .child(div().text_size(TYPE.ui).font_semibold().text_color(t.foreground).child(g.title))
-                      .child(div().text_size(TYPE.meta).text_color(t.muted).child(String(items.length))),
-                  )
+                  .child(sectionHead(t, { level: "group", title: g.title, count: items.length }))
                   .children(items.map((it, i) => this.item(t, it, g.ordered ? i + 1 : null, i, items.length)));
               }),
             )
@@ -157,14 +141,14 @@ export class TodoView {
                 v_flex()
                   .gap(4)
                   .child(
-                    h_flex()
-                      .id("todo-done-toggle")
-                      .gap(SP.sm)
-                      .items_center()
-                      .cursor_pointer()
-                      .on_click((_e, cx) => ((this.showDone = !this.showDone), cx.notify()))
-                      .child(icon(this.showDone ? "chevron-down" : "chevron-right", 11, t.muted))
-                      .child(div().text_size(TYPE.ui).font_semibold().text_color(t.muted).child(`Done and dropped · ${closed.length}`)),
+                    sectionHead(t, {
+                      id: "todo-done-toggle",
+                      level: "group",
+                      title: "Done and dropped",
+                      count: closed.length,
+                      open: this.showDone,
+                      onToggle: cx => ((this.showDone = !this.showDone), cx.notify()),
+                    }),
                   )
                   .when(this.showDone, e2 => e2.children(closed.slice(0, 40).map(it => this.closedRow(t, it)))),
               ),
@@ -200,7 +184,7 @@ export class TodoView {
     const tone = { doing: t.working, blocked: t.blocked, next: t.muted }[it.status] ?? t.muted;
     const lead =
       it.status === "doing"
-        ? statusGlyph("working", t, 13)
+        ? statusGlyph("working", t, 13, { still: this.app.palette?.open })
         : it.status === "blocked"
           ? icon("alert", 13, t.blocked)
           : div().w(20).text_size(TYPE.ui).font_semibold().text_color(t.muted).child(`${n}.`);

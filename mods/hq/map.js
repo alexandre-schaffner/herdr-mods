@@ -1,21 +1,16 @@
 // Map: HQ's home. The org and the work in flight as a live diagram: the PR Lens graph the master
-// keeps (`hq lens`), drawn natively (lanes, cards, edges) with live state laid over it from the
+// keeps (`hq lens`), drawn natively as a tree (the master at the root, each manager a branch, its
+// work below it) with the links that cut across (stacked PRs, the merge queue) curving over it,
+// and live state laid over it from the
 // snapshot: a manager working spins, one that needs you turns red. Zoom with ⌘-scroll, + and −,
 // or Fit; scroll to pan. Click a card for its inspector: a manager's opens its full detail.
 
 import { h_flex, Scrollbar, v_flex } from "gpui-base";
 import { div, PathBuilder } from "gpui-kit";
-import { readTextFile } from "herdr";
 
-import { ago, alpha, btn, chip, clip, icon, mdBlock, mix, mono, ok, plain, row, SP, statusGlyph, statusLook, tone, TYPE } from "./ui.js";
-
-// Layout units at zoom 1 (px).
-// Cards sit `inset` in from a lane's left edge; same-lane links run down the `gutter` on their right.
-const U = { pad: 32, laneW: 250, laneGap: 40, head: 52, cardH: 92, rowGap: 32, inset: 14, gutter: 24 };
-/** Units between links that share a track. */
-const TRACK = 5;
-const ZMIN = 0.35;
-const ZMAX = 2;
+import { loadPr, prNumber, prPanel } from "./map-pr.js";
+import { branch, buildTree, cross, fitted, labelSpot, labelW, layout, roundedPolyline, ZMAX, ZMIN } from "./map-tree.js";
+import { agentMark, ago, alpha, btn, chip, clip, clock, drawer, empty, icon, lines, mdBlock, mix, mono, pageHeader, pane, plain, row, SP, statusGlyph, tone, toolbar, TYPE } from "./ui.js";
 
 const KIND_ICON = {
   service: "layers",
@@ -38,24 +33,21 @@ const KIND_ICON = {
 export class MapView {
   constructor(app) {
     this.app = app;
-    this.z = Number(localStorage.getItem("map.zoom.v2") ?? 0) || null; // null: fit on first layout
+    this.z = Number(localStorage.getItem("map.zoom.v3") ?? 0) || null; // null: fit on first layout
     this.sel = null;
     this.size = null;
     this.allLinks = localStorage.getItem("map.links") === "all";
     // Zoom follows Fit (reflowing to the window's shape) until the person zooms by hand.
-    this.autoFit = localStorage.getItem("map.autofit") !== "0";
+    this.autoFit = localStorage.getItem("map.autofit.v3") !== "0";
   }
 
-  /** Links worth drawing: within a lane (the lane's own story), the hero, what changed, and
-   *  every link of the selected card. The master's "directs" links and unchanged context
-   *  between lanes stay hidden unless asked for: the lanes already say who owns what. */
+  /** Links worth drawing: the tree's branches, the hero, what changed, and every link of the
+   *  selected card. Unchanged links across branches stay hidden unless asked for. */
   essential(e, g) {
+    if (g.tree.has(e.id ?? `${e.from}>${e.to}`)) return true; // the branches: always
     if (this.allLinks) return true;
     if (this.sel && (e.from === this.sel || e.to === this.sel)) return true;
     if (e.emphasis === "hero") return true;
-    const a = g.pos[e.from];
-    const b = g.pos[e.to];
-    if (a && b && a.lane === b.lane) return true;
     if (e.from === "master" || e.to === "master") return false;
     return !!e.delta && e.delta !== "unchanged" && e.delta !== "removed";
   }
@@ -65,48 +57,39 @@ export class MapView {
       this.sel = null;
       this.pick(arg.node, cx);
     }
-    // TEMP drive (hq pass verification): /tmp/hq-pass/drive.json sets zoom, fit, selection, palette.
-    cx.spawn(async cx => {
-      const s = JSON.parse((await readTextFile("/tmp/hq-pass/drive.json").catch(() => null)) ?? "null");
-      if (!s) return;
-      if (s.zoom) this.setZoom(s.zoom, cx);
-      if (s.fit) this.fit(cx);
-      if ("sel" in s) {
-        this.sel = null;
-        if (s.sel) this.pick(s.sel, cx);
-      }
-      if ("palette" in s) s.palette ? this.app.palette.show(cx) : this.app.palette.hide(cx);
-      cx.notify();
-    });
   }
 
   setZoom(z, cx, manual = true) {
     // A hand zoom leaves Fit mode; Fit (manual = false) returns to it.
     this.autoFit = !manual;
-    localStorage.setItem("map.autofit", this.autoFit ? "1" : "0");
+    localStorage.setItem("map.autofit.v3", this.autoFit ? "1" : "0");
     this.z = Math.max(ZMIN, Math.min(ZMAX, Math.round(z * 100) / 100));
-    localStorage.setItem("map.zoom.v2", String(this.z));
+    localStorage.setItem("map.zoom.v3", String(this.z));
     cx.notify();
   }
 
   fit(cx) {
-    if (!this.graph()) return;
-    const f = this.fitted();
+    const f = this.fitting();
     if (!f) return;
-    this.cols = f.c;
+    this.orient = f.o;
     this.setZoom(f.z, cx, false);
   }
 
-  /** The canvas's own box changed (the window, the panel opening or closing): Fit follows it;
-   *  a hand zoom keeps its zoom and reflows the lanes to the new width. */
+  /** The canvas's own box changed (the window, the panel opening or closing): Fit follows it
+   *  (and picks the tree's direction); a hand zoom keeps its zoom and direction. */
   onCanvasSize(size, cx) {
     this.size = size;
     if (this.autoFit || this.z == null) return this.fit(cx);
-    this.cols = this.colsAt(this.z);
     cx.notify();
   }
 
   pick(id, cx) {
+    const pn = this.graph()?.byId[id];
+    if (pn && this.category(pn) === "pr" && prNumber(pn)) {
+      this.allChecks = false;
+      this.fullBody = false;
+      loadPr(this, prNumber(pn), cx);
+    }
     this.sel = this.sel === id ? null : id;
     const m = this.sel && this.managerFor(this.sel);
     if (m) this.app.views.org.select(m === "master" ? "master" : m.id, cx);
@@ -151,80 +134,41 @@ export class MapView {
     return null;
   }
 
-  // ---- layout: lanes as columns; within a lane, longest path along the lane's own edges.
+  // ---- the map: the lens doc's tree (map-tree.js), laid out in the direction Fit picked
 
-  graph() {
+  /** The tree, rebuilt when a new map arrives; null until there is one. */
+  base() {
     const doc = this.app.data?.lens?.doc;
     if (!doc?.nodes?.length) return null;
     if (this._doc !== doc) {
-      const lanes = [...(doc.lanes ?? [])].map((l, i) => ({ ...l, i })).sort((a, b) => (a.order ?? 1e3 + a.i) - (b.order ?? 1e3 + b.i));
-      const byId = Object.fromEntries(doc.nodes.map(n => [n.id, n]));
-      const edges = (doc.edges ?? []).filter(e => byId[e.from] && byId[e.to]);
-      const inLane = {};
-      for (const e of edges) if (byId[e.from].lane === byId[e.to].lane) (inLane[e.to] ??= []).push(e.from);
-      const rank = {};
-      const depth = (id, seen = new Set()) => {
-        if (rank[id] != null) return rank[id];
-        if (seen.has(id)) return 0;
-        seen.add(id);
-        return (rank[id] = Math.max(-1, ...(inLane[id] ?? []).map(p => depth(p, seen))) + 1);
-      };
-      doc.nodes.forEach(n => depth(n.id));
-      for (const l of lanes)
-        l.nodes = doc.nodes.map((n, i) => ({ n, i })).filter(x => x.n.lane === l.id).sort((a, b) => rank[a.n.id] - rank[b.n.id] || a.i - b.i).map(x => x.n);
       this._doc = doc;
-      this._base = { doc, lanes, byId, edges };
+      this._base = buildTree(doc);
       this._layouts = {};
-      const f = this.size && this.autoFit ? this.fitted() : null;
-      if (f) [this.cols, this.z] = [f.c, f.z];
-      else if (this.size) this.cols = this.colsAt(this.z ?? 1);
     }
-    return this.layout(this.cols ?? this._base.lanes.length);
+    return this._base;
   }
 
-  /** Lanes in a grid of `cols` columns (reading order), each grid row as tall as its fullest lane. */
-  layout(cols) {
-    const base = this._base;
-    const c = Math.max(1, Math.min(cols, base.lanes.length));
-    if (this._layouts[c]) return this._layouts[c];
-    const pos = {};
-    const bands = [];
-    let y = U.pad;
-    for (let r = 0; r * c < base.lanes.length; r++) {
-      const rowLanes = base.lanes.slice(r * c, r * c + c);
-      const rows = Math.max(1, ...rowLanes.map(l => l.nodes.length));
-      const bandH = U.head + rows * (U.cardH + U.rowGap) - U.rowGap + U.inset + 4;
-      rowLanes.forEach((l, k) => {
-        const x = U.pad + k * (U.laneW + U.laneGap);
-        bands.push({ l, x, y, h: bandH });
-        l.nodes.forEach((n, i) => {
-          pos[n.id] = { x: x + U.inset, y: y + U.head + i * (U.cardH + U.rowGap), w: U.laneW - U.inset - U.gutter, h: U.cardH, lane: `${r}:${k}`, col: k, row: r, i, laneX: x, rows: l.nodes.length };
-        });
-      });
-      y += bandH + U.laneGap;
-    }
-    const W = U.pad * 2 + c * U.laneW + (c - 1) * U.laneGap;
-    const H = y - U.laneGap + U.pad;
-    return (this._layouts[c] = { ...base, pos, bands, W, H, cols: c });
+  /** The tree laid out in direction `o`, kept until the map changes. */
+  laid(o) {
+    return (this._layouts[o] ??= layout(this._base, o));
   }
 
-  /** The column count whose layout fits the canvas at the largest zoom, and that zoom (floored,
-   *  so the fitted map never overflows by a rounding pixel). */
-  fitted() {
-    if (!this._base || !this.size) return null;
-    let best = null;
-    for (let c = 1; c <= this._base.lanes.length; c++) {
-      const g = this.layout(c);
-      const z = Math.min(this.size.width / g.W, this.size.height / g.H);
-      if (!best || z > best.z + 0.001) best = { c, z };
-    }
-    return { c: best.c, z: Math.max(ZMIN, Math.min(1.25, Math.floor(best.z * 100) / 100)) };
+  /** The map as drawn. Only reads: Fit (and a new map, in onData) sets the direction and zoom. */
+  graph() {
+    return this.base() && this.laid(this.orient ?? "down");
   }
 
-  /** At a hand-set zoom: the most columns whose width fits the canvas. */
-  colsAt(z) {
-    for (let c = this._base.lanes.length; c > 1; c--) if (this.layout(c).W * z <= this.size.width) return c;
-    return 1;
+  /** The direction and zoom Fit picks for this map in this canvas; null before there's either. */
+  fitting() {
+    return this.base() && this.size ? fitted(["down", "right"].map(o => this.laid(o)), this.size) : null;
+  }
+
+  /** A new map reflows Fit to its shape; a hand zoom keeps its zoom and direction. */
+  onData() {
+    const prev = this._base;
+    if (this.base() === prev || !this.autoFit) return;
+    const f = this.fitting();
+    if (f) [this.orient, this.z] = [f.o, f.z];
   }
 
   // ---- drawing
@@ -242,8 +186,12 @@ export class MapView {
         row()
           .flex_1()
           .min_h(0)
-          .child(g ? v_flex().flex_1().min_w(0).min_h(0).child(this.canvas(t, d, g)).child(this.legend(t)) : this.empty(t))
-          .when(!!this.sel && !!g?.byId[this.sel], el => el.child(this.drawer(t, d, g))),
+          .child(
+            g
+              ? v_flex().flex_1().min_w(0).min_h(0).child(this.canvas(t, d, g)).child(this.legend(t))
+              : empty(t, "No map yet", "Once the org has a master and managers, the map draws itself here, and the master keeps it current.", { icon: "flow" }),
+          )
+          .when(!!this.sel && !!g?.byId[this.sel], el => el.child(this.drawer(t, g))),
       );
   }
 
@@ -276,49 +224,42 @@ export class MapView {
     const l = d.lens ?? {};
     const z = this.z ?? 1;
     const chips = g?.doc.stats?.chips ?? [];
-    const tone = c => ({ added: ok(t), modified: t.ansi3 ?? t.working, removed: t.blocked, hero: t.accent })[c.tone] ?? t.muted;
-    return row()
-      .flex_none()
-      .h(48)
-      .px(SP.lg)
-      .gap(SP.md)
-      .items_center()
-      .border_b(1)
-      .border_color(alpha(t.border, 0.6))
+    const shown = chips.slice(0, 3);
+    const title = g?.doc.title ?? "Live map";
+    // The strip already names the repo.
+    const repo = `${d.repo?.name ?? ""}: `.toLowerCase();
+    const short = title.toLowerCase().startsWith(repo) ? title.slice(repo.length) : title;
+    const asOf = l.at ? `From the master's map, as of ${clock(l.at)}` : null;
+    return toolbar(t, [])
       .child(
         v_flex()
-          .flex_none()
-          .max_w(420)
+          .id("map-title")
+          .flex_1()
+          .min_w(0)
           .gap(1)
-          .child(div().truncate().text_size(TYPE.body).font_semibold().text_color(t.foreground).child(clip(g?.doc.title ?? "Live map", 90)))
+          .tooltip(title)
+          .child(div().truncate().text_size(TYPE.body).font_semibold().text_color(t.foreground).child(short))
           .child(
             div()
+              .truncate()
               .text_size(TYPE.meta)
               .text_color(t.muted)
               .child(l.auto ? "Drawn from the org until the master publishes its map" : `Kept by the master · updated ${ago(l.at, d.now)}`),
           ),
       )
-      .child(
-        h_flex()
-          .flex_1()
-          .min_w(0)
-          .gap(6)
-          .overflow_hidden()
-          .children(
-            chips.map((c, i) =>
-              h_flex()
-                .id(`map-chip-${i}`)
-                .flex_none()
-                .h(24)
-                .px(8)
-                .gap(5)
-                .items_center()
-                .rounded(6)
-                .bg(alpha(tone(c), 0.1))
-                .child(div().text_size(TYPE.meta).text_color(t.muted).child(c.label))
-                .child(div().text_size(TYPE.meta).font_semibold().text_color(c.tone === "neutral" || !c.tone ? t.foreground : tone(c)).child(c.value)),
-            ),
-          ),
+      .children(
+        shown.map((c, i) => chip(t, c.label, docTone(t, c.tone), { id: `map-chip-${i}`, value: c.value, h: 24, size: TYPE.meta, tooltip: asOf })),
+      )
+      .when(chips.length > shown.length, el =>
+        el.child(
+          div()
+            .id("map-chip-more")
+            .flex_none()
+            .text_size(TYPE.meta)
+            .text_color(t.muted)
+            .tooltip(chips.slice(shown.length).map(c => `${c.label}: ${c.value}`).join("\n"))
+            .child(`+${chips.length - shown.length}`),
+        ),
       )
       .child(
         h_flex()
@@ -352,50 +293,40 @@ export class MapView {
             this.allLinks = !this.allLinks;
             localStorage.setItem("map.links", this.allLinks ? "all" : "essential");
             cx.notify();
-          }, { kind: "ghost", size: "sm", icon: "flow", tooltip: "Essential: within a lane, the hero link and what changed. Select a card to see all of its links." }),
+          }, { kind: "ghost", size: "sm", icon: "flow", tooltip: "Essential: the tree, the hero link and what changed. Select a card to see all of its links." }),
         );
       })
-      .child(btn(t, "map-new", null, cx => this.app.go("org", cx, { create: true }), { kind: "ghost", size: "sm", icon: "user", tooltip: "New manager" }));
-  }
-
-  empty(t) {
-    return v_flex()
-      .flex_1()
-      .items_center()
-      .justify_center()
-      .gap(SP.sm)
-      .child(icon("flow", 26, t.muted))
-      .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("No map yet"))
-      .child(div().max_w(420).text_center().text_size(TYPE.ui).text_color(t.muted).child("Once the org has a master and managers, the map draws itself here, and the master keeps it current."));
+      .child(btn(t, "map-new", null, cx => this.app.go("org", cx, { create: true }), { kind: "ghost", size: "sm", icon: "plus", tooltip: "New manager" }));
   }
 
   canvas(t, d, g) {
     const z = this.z ?? 1;
     const S = v => Math.round(v * z);
     const children = [];
-    // Lane bands.
-    g.bands.forEach(({ l, x, y, h }) => {
+    // Lane headings: a branch for a lane whose work has no card of its own above it.
+    for (const [id, gr] of Object.entries(g.groups)) {
+      const p = g.pos[id];
       children.push(
         v_flex()
           .absolute()
-          .left(S(x))
-          .top(S(y))
-          .w(S(U.laneW))
-          .h(S(h))
-          .rounded(S(14))
-          .bg(alpha(t.foreground, 0.035))
-          .px(S(U.inset))
-          .pt(S(14))
+          .left(S(p.x))
+          .top(S(p.y))
+          .w(S(p.w))
+          .h(S(p.h))
+          .justify_center()
+          .rounded(S(10))
+          .bg(alpha(t.foreground, 0.05))
+          .px(S(12))
           .child(
             h_flex()
               .gap(S(6))
               .items_center()
-              .child(div().min_w(0).truncate().text_size(S(12.5)).font_semibold().text_color(t.foreground).child(l.label))
-              .when(!!DELTA_TONE[l.delta], el => el.child(deltaDot(t, l.delta, S(7)))),
+              .child(div().min_w(0).truncate().text_size(S(12)).font_semibold().text_color(t.foreground).child(gr.label))
+              .when(!!DELTA_TONE[gr.delta], el => el.child(deltaDot(t, gr.delta, S(7)))),
           )
-          .when(!!l.subtitle, el => el.child(div().min_w(0).truncate().text_size(S(11)).text_color(t.muted).child(l.subtitle))),
+          .when(!!gr.subtitle, el => el.child(div().min_w(0).truncate().text_size(S(10.5)).text_color(t.muted).child(gr.subtitle))),
       );
-    });
+    }
     // Edges, grouped by look so each look is one native path.
     const pens = {};
     const pen = key =>
@@ -405,21 +336,34 @@ export class MapView {
           : PathBuilder.stroke(key.startsWith("hero") || key.startsWith("focus") ? Math.max(2, S(2.4)) : Math.max(1, S(1.4))),
         heads: [],
       });
-    // Orthogonal routes through free space only (see route()), spread where they share a track.
-    const routes = spread(g.edges.filter(e => g.pos[e.from] && g.pos[e.to] && this.essential(e, g)).map(e => ({ e, ...route(g.pos[e.from], g.pos[e.to]) })));
-    // Labels keep off the cards, the lane titles and each other.
-    const taken = [...Object.values(g.pos), ...g.bands.map(b => ({ x: b.x, y: b.y, w: U.laneW, h: U.head }))];
+    // Branches: elbows from parent to child (siblings share the trunk, like a tree), lane
+    // headings included. Cross links: S-curves over the tree, with an arrowhead.
+    const down = g.orient === "down";
+    const keyOf = e => e.id ?? `${e.from}>${e.to}`;
+    const headEdges = Object.keys(g.groups).map(id => ({ id: `head:${id}`, from: g.root, to: id, kind: "call" }));
+    const routes = [
+      ...headEdges.map(e => ({ e, isBranch: true, ...branch(g.pos[e.from], g.pos[e.to], down) })),
+      ...g.edges
+        .filter(e => g.pos[e.from] && g.pos[e.to] && this.essential(e, g))
+        .map(e => (g.tree.has(keyOf(e)) ? { e, isBranch: true, ...branch(g.pos[e.from], g.pos[e.to], down) } : { e, ...cross(g.pos[e.from], g.pos[e.to], down) })),
+    ];
+    // Labels keep off the cards, the headings and each other.
+    const taken = Object.values(g.pos).map(p => ({ ...p }));
     const labels = [];
-    for (const { e, pts, label } of routes) {
+    for (const { e, pts, curve, label, isBranch } of routes) {
       const touches = this.sel && (e.from === this.sel || e.to === this.sel);
-      const look = touches ? `focus${e.animated ? ":anim" : ""}` : edgeLook(e);
+      const look = touches ? `focus${e.animated ? ":anim" : ""}` : isBranch && !e.emphasis && (!e.delta || e.delta === "unchanged") ? "unchanged" : edgeLook(e);
       const p = pen(look);
-      p.pb = roundedPolyline(p.pb, pts.map(([x, y]) => [S(x), S(y)]), S(8));
-      const [[px, py], [ex, ey]] = pts.slice(-2);
-      p.heads.push(arrowHead(S(ex), S(ey), Math.sign(ex - px), Math.sign(ey - py), Math.max(6, S(7)), Math.max(3.5, S(4))));
+      const P = pts.map(([x, y]) => [S(x), S(y)]);
+      if (curve) p.pb = p.pb.move_to(P[0][0], P[0][1]).cubic_bezier_to(P[3][0], P[3][1], P[1][0], P[1][1], P[2][0], P[2][1]);
+      else p.pb = roundedPolyline(p.pb, P, S(8));
+      if (!isBranch) {
+        const [[px, py], [ex, ey]] = pts.slice(-2);
+        p.heads.push(arrowHead(S(ex), S(ey), Math.sign(ex - px), Math.sign(ey - py), Math.max(6, S(7)), Math.max(3.5, S(4))));
+      }
       // Labels only where they carry news: the hero, changes, or the selected card's edges.
-      if (e.label && (touches || e.emphasis === "hero" || (e.delta && e.delta !== "unchanged" && !this.sel)))
-        labels.push({ e, look, ...labelSpot(pts[label], pts[label + 1], labelW(e.label), taken) });
+      if (e.label && e.label !== "directs" && (touches || e.emphasis === "hero" || (e.delta && e.delta !== "unchanged" && !this.sel)))
+        labels.push({ e, look, ...labelSpot(pts[label], pts[label + 1], labelW(e.label), taken, g.W, g.H) });
     }
     const dim = this.sel ? 0.35 : 1;
     const color = look =>
@@ -446,19 +390,21 @@ export class MapView {
           .justify_center()
           .child(
             div()
+              .w(S(labelW(e.label)))
               .px(S(6))
               .h(S(18))
               .flex()
               .items_center()
+              .justify_center()
+              .overflow_hidden()
               .rounded(S(9))
               .bg(t.background)
               .border(1)
               .border_color(alpha(color(look), 0.6))
               .text_size(S(10.5))
               .text_color(look.startsWith("hero") ? t.accent : t.muted)
-              .whitespace_nowrap()
               .tooltip(e.summary ? `${e.label}: ${plain(e.summary)}` : e.label)
-              .child(clip(e.label, 40)),
+              .child(div().min_w(0).truncate().child(clip(e.label, 40))),
           ),
       ),
     );
@@ -530,11 +476,12 @@ export class MapView {
           .gap(S(4))
           .min_w(0)
           .overflow_hidden()
-          .children(shown.map((b, i) => badgeChip(t, b, S, `${n.id}-${i}`)))
+          .children(shown.map((b, i) => chip(t, clip(b, 20), toneColor(t, badgeTone(b)), { id: `map-badge-${n.id}-${i}`, scale: this.z ?? 1 })))
           .when(badges.length > shown.length, e2 => e2.child(div().text_size(S(10)).text_color(t.muted).child(`+${badges.length - shown.length}`)))
       : null;
     const sub = n.subtitle || (cat === "agent" ? this.liveLine(n.id) : null);
-    const corner = status ? statusGlyph(status, t, S(12), { still: this.app.palette.open }) : changed ? deltaDot(t, n.delta, S(7)) : null;
+    // An agent's orb shows its status itself: only other nodes get a status glyph in the corner.
+    const corner = status && cat !== "agent" ? statusGlyph(status, t, S(12), { still: this.app.palette.open }) : changed ? deltaDot(t, n.delta, S(7)) : null;
     // A row's lead icon and corner glyph sit on its first line when the title wraps.
     const top = el => div().flex_none().mt(S(2)).child(el);
 
@@ -544,32 +491,15 @@ export class MapView {
     const avatar = unit ? 26 : 32;
     let body;
     if (cat === "agent") {
-      const isMaster = n.id === "master";
-      const tint = avatarColor(t, n.id);
+      const m = this.managerFor(n.id);
+      const kind = m === "master" ? "master" : unit ? "unit" : m?.kind === "merge-queue" ? "merge-queue" : "area";
+      // The subline gets the whole lines left under the title (two at most): rounding at small zooms leaves room for one.
+      const room = S(p.h) - 2 * S(9) - S(13) * 1.3 - S(3) - (badgeRow ? S(18) + S(5) : 0);
+      const subLines = Math.min(2, Math.floor(room / (S(11) * 1.3)));
       body = h_flex()
         .gap(S(10))
         .items_start()
-        .child(
-          div()
-            .flex_none()
-            .mt(S(1))
-            .w(S(avatar))
-            .h(S(avatar))
-            .rounded_full()
-            .border(S(2))
-            .border_color(status ? statusLook(status, t).color : alpha(t.border, 0.9))
-            .bg(alpha(tint, 0.16))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-              isMaster
-                ? icon("crown", S(14), t.accent)
-                : unit
-                  ? icon("bolt", S(12), tint)
-                  : div().text_size(S(12)).font_semibold().text_color(tint).child(initials(n.label)),
-            ),
-        )
+        .child(agentMark(t, { avatar: true, kind, id: n.id, label: n.label, status, size: S(avatar), still: this.app.palette.open }).mt(S(1)))
         .child(
           v_flex()
             .flex_1()
@@ -582,7 +512,7 @@ export class MapView {
                 .child(strike(div().flex_1().min_w(0).truncate().text_size(S(13)).line_height(1.3).font_semibold().text_color(t.foreground).child(n.label)))
                 .when(!!corner, el => el.child(corner)),
             )
-            .when(!!sub, el => el.child(lines(sub, S(11), 2, 20).text_color(t.muted))),
+            .when(!!sub && subLines > 0, el => el.child(lines(sub, S(11), subLines, 20).text_color(t.muted))),
         );
     } else if (cat === "pr") {
       const m = /^(#\d+)\s*(.*)$/.exec(n.label ?? "");
@@ -594,7 +524,7 @@ export class MapView {
           h_flex()
             .gap(S(6))
             .items_start()
-            .child(top(icon(null, S(13), look.c, "mods/hq/icons/git-pull-request.svg")))
+            .child(div().flex_none().h(S(13) * 1.3).flex().items_center().child(icon(null, S(13), look.c, "mods/hq/icons/git-pull-request.svg")))
             .when(!!num, el => el.child(div().flex_none().text_size(S(13)).line_height(1.3).font_semibold().font_family(mono()).text_color(look.c).child(num)))
             .child(strike(lines(title, S(12.5), 2, 15).flex_1().font_medium().text_color(t.foreground)))
             .when(!!corner && !!status, el => el.child(top(corner))),
@@ -671,172 +601,54 @@ export class MapView {
       .when(!!badgeRow, el => el.child(cat === "agent" ? div().flex_none().pl(S(avatar + 10)).child(badgeRow) : badgeRow));
   }
 
-  drawer(t, d, g) {
+  drawer(t, g) {
     const n = g.byId[this.sel];
     const m = this.managerFor(n.id);
+    const cat = this.category(n);
+    const rels = g.edges.filter(e => e.from === n.id || e.to === n.id);
     const body = m
       ? this.app.views.org.detail(t)
-      : v_flex()
-          .p(SP.xl)
-          .gap(SP.md)
-          .child(
-            h_flex()
-              .gap(SP.sm)
-              .items_center()
-              .child(icon(KIND_ICON[n.kind] ?? "square", 16, t.muted))
-              .child(div().text_size(TYPE.heading).font_semibold().child(n.label)),
-          )
-          .when(!!n.subtitle, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child(n.subtitle)))
-          .child(
-            h_flex()
-              .gap(6)
-              .flex_wrap()
-              .child(chip(t, n.kind, t.muted))
-              .when(!!n.delta && n.delta !== "unchanged", el => el.child(chip(t, n.delta, { added: ok(t), modified: t.ansi3 ?? t.working, removed: t.blocked }[n.delta])))
-              .children((n.badges ?? []).map(b => chip(t, b, t.accent))),
-          )
-          .when(!!n.summary, el => el.child(mdBlock(t, `map-sum-${n.id}`, n.summary, { maxW: 500 })))
-          .child(
-            v_flex()
-              .gap(4)
-              .pt(SP.sm)
-              .children(
-                g.edges
-                  .filter(e => e.from === n.id || e.to === n.id)
-                  .map((e, i) => {
-                    const other = g.byId[e.from === n.id ? e.to : e.from];
-                    return h_flex()
-                      .id(`map-rel-${i}`)
-                      .gap(6)
-                      .items_center()
-                      .cursor_pointer()
-                      .hover(s => s.underline())
-                      .on_click((_e, cx) => this.pick(other.id, cx))
-                      .child(icon(e.from === n.id ? "arrow-right" : "arrow-left", 11, t.muted))
-                      .child(div().text_size(TYPE.ui).text_color(t.foreground).child(other.label))
-                      .when(!!e.label, el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(e.label)));
-                  }),
+      : pane(
+          "map-drawer-scroll",
+          v_flex()
+            .gap(SP.lg)
+            .when(cat === "pr" && !!prNumber(n), el => el.child(prPanel(this, t, prNumber(n), n)))
+            .when(!(cat === "pr" && prNumber(n)), el => el.child(
+              pageHeader(t, {
+                glyph: icon(KIND_ICON[n.kind] ?? "square", 16, t.muted),
+                title: n.label,
+                chips: [
+                  ...(DELTA_TONE[n.delta] ? [chip(t, n.delta, docTone(t, n.delta))] : []),
+                  ...(n.badges ?? []).map(b => chip(t, b, toneColor(t, badgeTone(b)))),
+                ],
+                meta: [n.kind, n.subtitle].filter(Boolean).join(" · ") || null,
+              }),
+            ))
+            .when(!!n.summary, el => el.child(mdBlock(t, `map-sum-${n.id}`, n.summary, { maxW: 500 })))
+            .when(rels.length > 0, el =>
+              el.child(
+                v_flex()
+                  .gap(4)
+                  .children(
+                    rels.map((e, i) => {
+                      const other = g.byId[e.from === n.id ? e.to : e.from];
+                      return h_flex()
+                        .id(`map-rel-${i}`)
+                        .gap(6)
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(s => s.underline())
+                        .on_click((_e, cx) => this.pick(other.id, cx))
+                        .child(icon(e.from === n.id ? "arrow-right" : "arrow-left", 11, t.muted))
+                        .child(div().text_size(TYPE.ui).text_color(t.foreground).child(other.label))
+                        .when(!!e.label, el => el.child(div().text_size(TYPE.meta).text_color(t.muted).child(e.label)));
+                    }),
+                  ),
               ),
-          );
-    return v_flex()
-      .flex_none()
-      .w(560)
-      .min_h(0)
-      .border_l(1)
-      .border_color(t.border)
-      .bg(t.background)
-      .child(
-        row()
-          .flex_none()
-          .h(36)
-          .px(SP.md)
-          .items_center()
-          .border_b(1)
-          .border_color(alpha(t.border, 0.6))
-          .child(div().flex_1().text_size(TYPE.meta).text_color(t.muted).child(m ? "Manager" : "On the map"))
-          .child(btn(t, "map-drawer-close", null, cx => ((this.sel = null), cx.notify()), { kind: "ghost", size: "sm", icon: "x", tooltip: "Close (Esc)" })),
-      )
-      .child(v_flex().flex_1().min_h(0).child(m ? body : div().id("map-drawer-scroll").size_full().overflow_y_scroll().child(body)));
+            ),
+        );
+    return drawer(t, { id: "map-drawer", title: m ? "Manager" : CAT_WORD[cat], onClose: cx => ((this.sel = null), cx.notify()), body });
   }
-}
-
-/**
- * A link's path through free space only, in layout units: its points, and which segment carries
- * its label. Cards sit in lanes (columns) and rows; between lanes run vertical gaps, between card
- * rows horizontal gaps, and inside a lane a gutter to the right of the cards.
- *   - same lane, next card: straight down the middle;
- *   - same lane, further: out the right side, down the gutter, in the right side;
- *   - other lane: out the facing side into the lane gap, along the row gap just above the
- *     target (or below it for a first-row target) to the gap beside the target's lane, then in.
- */
-function route(a, b) {
-  const midY = p => p.y + p.h / 2;
-  const gapR = p => p.laneX + U.laneW + U.laneGap / 2;
-  const gapL = p => p.laneX - U.laneGap / 2;
-  if (a.lane === b.lane) {
-    const down = b.y > a.y;
-    if (Math.abs(b.i - a.i) === 1) {
-      const x = a.x + a.w / 2;
-      return { pts: [[x, down ? a.y + a.h : a.y], [x, down ? b.y : b.y + b.h]], label: 0 };
-    }
-    const gx = a.x + a.w + U.gutter / 2;
-    return { pts: [[a.x + a.w, midY(a)], [gx, midY(a)], [gx, midY(b)], [b.x + b.w, midY(b)]], label: 1 };
-  }
-  const right = b.col > a.col || (b.col === a.col && b.row !== a.row);
-  const sx = right ? a.x + a.w : a.x;
-  const g1 = right ? gapR(a) : gapL(a);
-  // Entering the target from the side that faces the source (same column: the right side).
-  const enterRight = b.col <= a.col;
-  const tx = enterRight ? b.x + b.w : b.x;
-  const g2 = enterRight ? gapR(b) : gapL(b);
-  // Neighbouring lanes (or the same column in another band): one shared gap.
-  if (Math.abs(g1 - g2) < 1) return { pts: [[sx, midY(a)], [g1, midY(a)], [g1, midY(b)], [tx, midY(b)]], label: 1 };
-  const ch = b.i > 0 ? b.y - U.rowGap / 2 : b.y + b.h + U.rowGap / 2;
-  return { pts: [[sx, midY(a)], [g1, midY(a)], [g1, ch], [g2, ch], [g2, midY(b)], [tx, midY(b)]], label: 2 };
-}
-
-/** Links that run along the same track (a vertical at one x, a horizontal at one y, which
- *  includes several links leaving or entering one card side) each get their own, TRACK units
- *  apart, alternating either side of it. Mutates and returns the routes. */
-function spread(routes) {
-  const used = {};
-  const take = key => {
-    const n = (used[key] = (used[key] ?? 0) + 1) - 1;
-    return (n % 2 ? 1 : -1) * Math.ceil(n / 2) * TRACK;
-  };
-  for (const { pts } of routes) {
-    const segs = pts.slice(1).map((q, k) => ({ k, vertical: q[0] === pts[k][0] }));
-    for (const { k, vertical } of segs) {
-      const off = vertical ? take(`v:${pts[k][0]}`) : take(`h:${pts[k][1]}`);
-      for (const q of [pts[k], pts[k + 1]]) q[vertical ? 0 : 1] += off;
-    }
-  }
-  return routes;
-}
-
-/** Where a label sits on its segment: the free spot nearest the middle, stepping along it a few
- *  units at a time, so it never covers a box in `taken` (cards, lane titles, labels). Takes its box. */
-function labelSpot([x1, y1], [x2, y2], w, taken) {
-  const n = Math.max(1, Math.floor(Math.hypot(x2 - x1, y2 - y1) / 6));
-  const fs = Array.from({ length: n + 1 }, (_, i) => i / n).sort((a, b) => Math.abs(a - 0.5) - Math.abs(b - 0.5));
-  const at = f => ({ x: x1 + (x2 - x1) * f, y: y1 + (y2 - y1) * f });
-  const box = s => ({ x: s.x - w / 2, y: s.y - 9, w, h: 18 });
-  const hits = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
-  const spot = fs.map(at).find(s => !taken.some(o => hits(box(s), o))) ?? at(0.5);
-  taken.push(box(spot));
-  return spot;
-}
-
-/** A polyline with its corners rounded (radius r, clipped to half of each segment). */
-function roundedPolyline(pb, pts, r) {
-  pb = pb.move_to(pts[0][0], pts[0][1]);
-  for (let k = 1; k < pts.length; k++) {
-    const [x, y] = pts[k];
-    if (k === pts.length - 1) {
-      pb = pb.line_to(x, y);
-      break;
-    }
-    const [px, py] = pts[k - 1];
-    const [nx, ny] = pts[k + 1];
-    const d1 = Math.hypot(x - px, y - py);
-    const d2 = Math.hypot(nx - x, ny - y);
-    const rr = Math.min(r, d1 / 2, d2 / 2);
-    if (rr < 0.5) {
-      pb = pb.line_to(x, y);
-      continue;
-    }
-    const ax = x - ((x - px) / d1) * rr;
-    const ay = y - ((y - py) / d1) * rr;
-    const bx = x + ((nx - x) / d2) * rr;
-    const by = y + ((ny - y) / d2) * rr;
-    pb = pb.line_to(ax, ay).curve_to(bx, by, x, y);
-  }
-  return pb;
-}
-
-/** A label chip's width in layout units, from its (clipped) text. */
-function labelW(text) {
-  return Math.min(40, (text ?? "").length) * 6.2 + 16;
 }
 
 const CAT_WORD = { agent: "Agent", pr: "Pull request", process: "Process", file: "File" };
@@ -869,23 +681,6 @@ function cardLook(t, cat, c = t.accent) {
   }[cat];
 }
 
-/** Text wrapped to at most `n` lines: clipped to about that many characters, its height capped as a backstop. */
-function lines(text, size, n, perLine) {
-  return div().min_w(0).text_size(size).line_height(1.3).max_h(Math.ceil(size * 1.3 * n)).overflow_hidden().child(clip(text, perLine * n));
-}
-
-const AVATAR_SLOTS = ["ansi4", "ansi5", "ansi6", "ansi2", "ansi3", "ansi12", "ansi13", "ansi14"];
-function avatarColor(t, id) {
-  let h = 0;
-  for (const ch of id ?? "") h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return t[AVATAR_SLOTS[h % AVATAR_SLOTS.length]] ?? t.accent;
-}
-
-function initials(label) {
-  const words = (label ?? "").replace(/[^A-Za-z0-9 ]/g, " ").trim().split(/\s+/).filter(Boolean);
-  return ((words[0]?.[0] ?? "?") + (words[1]?.[0] ?? "")).toUpperCase();
-}
-
 function edgeLook(e) {
   const kind = e.emphasis === "hero" ? "hero" : (e.delta ?? "unchanged");
   return `${kind}${e.animated ? ":anim" : ""}${e.delta === "removed" ? ":dash" : ""}`;
@@ -899,22 +694,4 @@ function arrowHead(x, y, sx, sy, L, W) {
 
 function deltaDot(t, delta, size) {
   return div().flex_none().w(size).h(size).rounded_full().bg(docTone(t, delta)).tooltip(delta);
-}
-
-function badgeChip(t, text, S, key) {
-  const c = toneColor(t, badgeTone(text));
-  return div()
-    .id(`map-badge-${key}`)
-    .flex_none()
-    .px(S(6))
-    .h(S(18))
-    .flex()
-    .items_center()
-    .rounded(S(5))
-    .bg(alpha(c, 0.12))
-    .text_size(S(10.5))
-    .font_medium()
-    .text_color(c)
-    .whitespace_nowrap()
-    .child(clip(text, 20));
 }

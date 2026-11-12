@@ -49,6 +49,12 @@ export class Palette {
     for (const v of app.viewList())
       all.push({ id: `view-${v.id}`, group: "Go to", label: v.label, icon: v.icon, key: v.key, run: cx => app.go(v.id, cx) });
     if (d) {
+      for (const q of d.queues ?? [])
+        all.push({ id: `queue-${q.epic ?? "none"}`, group: "Merge queue", label: q.epic ? `${q.epic} queue` : "Merge queue", icon: "list", run: cx => app.go("queue", cx, { epic: q.epic }) });
+      for (const e of d.epics ?? []) {
+        if (!e.current) all.push({ id: `epic-${e.name}`, group: "Switch epic", label: e.label ?? e.name, icon: "layers", run: cx => app.pickEpic(e.name, cx) });
+        if (!e.main) all.push({ id: `roadmap-${e.name}`, group: "Roadmap", label: e.name, icon: "git-branch", run: cx => app.go("roadmap", cx, { epic: e.name }) });
+      }
       for (const it of (d.inbox ?? []).filter(i => i.state === "open"))
         all.push({
           id: `rv-${it.id}`,

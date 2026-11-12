@@ -7,8 +7,9 @@
 import { h_flex, Textarea, TextareaState, v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 
+import { options as bodyOptions, structure } from "./bodytext.js";
 import { openLink } from "./shared/viewer-link.js";
-import { ago, alpha, btn, chip, clip, frame, icon, label, mdBlock, mono, ok, plain, row, scrollY, SP, TYPE, tone } from "./ui.js";
+import { ago, alpha, btn, chip, clip, empty, frame, icon, label, linkBtn, mdBlock, mono, ok, plain, row, scrollY, sectionHead, SP, timeAgo, tone, TYPE } from "./ui.js";
 
 const KIND = {
   approval: { label: "Approval", icon: "alert", color: t => t.blocked },
@@ -22,6 +23,8 @@ const VERDICT = {
   answer: { word: "Answered", color: t => t.accent },
   ack: { word: "Looked over", color: t => t.muted },
   reopen: { word: "Reopened", color: t => tone(t).warn },
+  dismiss: { word: "Dismissed", color: t => t.muted },
+  resolved: { word: "Settled by the asker", color: t => t.muted },
 };
 
 const DECK_W = 860;
@@ -46,6 +49,11 @@ export class ReviewView {
     });
     this.note.on("change", (_e, cx) => {
       if (this.needNote) this.needNote = false;
+      // A note belongs to the card it is typed on: pin that card so a newer item (or another
+      // org's) can't slide under it, and remember whose note it is.
+      const h = this.hero();
+      if (h && !this.focusDone && !this.cur) this.cur = h.id;
+      if (this.note.value().trim()) this.noteFor ??= h?.id ?? null;
       cx.notify();
     });
   }
@@ -85,6 +93,7 @@ export class ReviewView {
 
   resetNote() {
     this.note.set_value("");
+    this.noteFor = null;
     this.needNote = false;
   }
 
@@ -105,7 +114,42 @@ export class ReviewView {
     cx?.notify();
   }
 
+  /** Dismiss asks twice: the first click arms it, the second closes the item. */
+  dismissBtn(t, it, busy, tip) {
+    const armed = this.armDismiss === it.id;
+    return btn(
+      t,
+      "rv-dismiss",
+      armed ? "Close without answering?" : "Dismiss",
+      cx => {
+        if (!armed) {
+          this.armDismiss = it.id;
+          cx.notify();
+          return;
+        }
+        this.armDismiss = null;
+        this.decide(it, "dismiss", cx);
+      },
+      { kind: armed ? "danger" : "ghost", disabled: busy, tooltip: tip },
+    );
+  }
+
+  /** A question answered by picking one of its options. */
+  choose(it, o, cx) {
+    const extra = this.note.value().trim();
+    this.note.set_value(`Option ${o.n}: ${o.text}${extra ? `. ${extra}` : ""}`);
+    this.noteFor = it.id;
+    this.decide(it, "answer", cx);
+  }
+
   decide(it, verdict, cx) {
+    // A note left over from another card (a decision just sent, another org's deck) never
+    // rides along: clear it and let the person look again.
+    if (this.note.value().trim() && this.noteFor && this.noteFor !== it.id) {
+      this.resetNote();
+      cx.notify();
+      return;
+    }
     const note = this.note.value().trim();
     if ((verdict === "reject" || verdict === "reopen" || verdict === "answer") && !note) {
       this.needNote = true;
@@ -119,9 +163,9 @@ export class ReviewView {
     this.app.act(cx, `decide-${it.id}`, ["decide", it.id, verdict, note], {
       fail: "Couldn't record the decision",
       then: (_r, cx) => {
+        this.resetNote();
         if (it.kind === "done") {
           this.focusDone = null;
-          this.resetNote();
           cx.notify();
         } else this.select(next?.id ?? null, cx);
       },
@@ -214,17 +258,10 @@ export class ReviewView {
       .when(n > 1 && i >= 0 && !this.focusDone, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child(`${i + 1} of ${n} · ← → to move`)))
       .when(!!this.focusDone, el =>
         el.child(
-          div()
-            .id("rv-back")
-            .text_size(TYPE.ui)
-            .text_color(t.accent)
-            .cursor_pointer()
-            .hover(s => s.underline())
-            .on_click((_e, cx) => {
-              this.focusDone = null;
-              cx.notify();
-            })
-            .child(n ? "Back to the decisions" : "Back"),
+          linkBtn(t, "rv-back", n ? "Back to the decisions" : "Back", cx => {
+            this.focusDone = null;
+            cx.notify();
+          }),
         ),
       );
   }
@@ -266,7 +303,7 @@ export class ReviewView {
                     .child(icon(k.icon, 12, k.color(t)))
                     .child(div().text_size(TYPE.meta).font_medium().text_color(k.color(t)).child(k.label))
                     .child(div().flex_1())
-                    .child(div().text_size(TYPE.meta).text_color(t.muted).child(ago(it.createdAt, now))),
+                    .child(timeAgo(t, it.createdAt, now)),
                 )
                 .child(div().text_size(TYPE.ui).font_medium().line_height(1.35).text_color(t.foreground).child(clip(plain(it.title), 70)))
                 .child(div().text_size(TYPE.meta).text_color(t.muted).child(`from ${this.who(it)}`));
@@ -276,29 +313,14 @@ export class ReviewView {
   }
 
   calm(t, ls) {
-    return v_flex()
-      .w_full()
-      .items_center()
-      .py(SP.xxl)
-      .gap(SP.sm)
-      .rounded(12)
-      .border(1)
-      .border_color(alpha(t.border, 0.6))
-      .child(icon("circle-check", 22, ok(t)))
-      .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("Nothing needs your decision"))
-      .child(
-        div()
-          .max_w(520)
-          .text_center()
-          .text_size(TYPE.ui)
-          .line_height(1.5)
-          .text_color(t.muted)
-          .child(
-            ls.done.length
-              ? "The org is running on its own. Its finished work is below, to look over when you have a moment."
-              : "Merges, deploys and messages to people land here for a yes or no, with exactly what will run and why.",
-          ),
-      );
+    return empty(
+      t,
+      "Nothing needs your decision",
+      ls.done.length
+        ? "The org is running on its own. Its finished work is below, to look over when you have a moment."
+        : "Merges, deploys and messages to people land here for a yes or no, with exactly what will run and why.",
+      { icon: "circle-check", tone: ok(t), framed: true },
+    );
   }
 
   /** The decision in front of the person: everything needed to decide, and the decision bar. */
@@ -363,7 +385,7 @@ export class ReviewView {
                 ),
             ),
           )
-          .when(!!body, el => el.child(v_flex().gap(6).child(label(t, it.kind === "done" ? "What changed" : "Why")).child(mdBlock(t, `rv-body-${it.id}`, body, { maxW: 760 }))))
+          .when(!!body, el => el.child(v_flex().gap(6).child(label(t, it.kind === "done" ? "What changed" : "Why")).child(mdBlock(t, `rv-body-${it.id}`, structure(body), { maxW: 760 }))))
           .when((it.links ?? []).length > 0, el => el.child(this.evidence(t, it))),
       )
       .child(this.bar(t, it));
@@ -404,10 +426,12 @@ export class ReviewView {
     const busy = this.app.isBusy(`decide-${it.id}`);
     const buttons = {
       approval: [
+        this.dismissBtn(t, it, busy, "Close it without a verdict (e.g. it's moot). Nothing is sent unless you add a note."),
         btn(t, "rv-reject", "Reject", cx => this.decide(it, "reject", cx), { kind: "danger", kbd: "R", disabled: busy }),
         btn(t, "rv-approve", "Approve", cx => this.decide(it, "approve", cx), { kind: "ok", kbd: "A", disabled: busy }),
       ],
       question: [
+        this.dismissBtn(t, it, busy, "Close it without answering. Nothing is sent unless you add a note."),
         btn(t, "rv-decline", "Decline", cx => this.decide(it, "reject", cx), { kind: "danger", kbd: "R", disabled: busy }),
         btn(t, "rv-answer", "Send answer", cx => this.decide(it, "answer", cx), { kind: "primary", disabled: busy }),
       ],
@@ -416,7 +440,8 @@ export class ReviewView {
         btn(t, "rv-ack", this.note.value().trim() ? "Looks good, send note" : "Looks good", cx => this.decide(it, "ack", cx), { kind: "ok", kbd: "E", disabled: busy }),
       ],
     }[it.kind];
-    const needs = it.kind === "question" ? "Write your answer first." : "Add a note first: it goes back with the decision.";
+    const needs = it.kind === "question" ? "Write your answer first, or pick one of the options above." : "Add a note first: it goes back with the decision.";
+    const opts = it.kind === "question" ? bodyOptions(it.body) : [];
     return v_flex()
       .px(SP.xl)
       .py(SP.md)
@@ -424,6 +449,33 @@ export class ReviewView {
       .border_t(1)
       .border_color(alpha(t.border, 0.7))
       .bg(alpha(t.foreground, 0.025))
+      .when(opts.length > 0, el =>
+        el.child(
+          v_flex()
+            .gap(6)
+            .pb(4)
+            .child(div().text_size(TYPE.meta).text_color(t.muted).child("Answer with one click (your note, if any, is added):"))
+            .children(
+              opts.map(o =>
+                row()
+                  .id(`rv-opt-${it.id}-${o.n}`)
+                  .px(SP.md)
+                  .py(8)
+                  .gap(SP.sm)
+                  .items_start()
+                  .rounded(8)
+                  .border(1)
+                  .border_color(alpha(t.accent, 0.35))
+                  .cursor_pointer()
+                  .hover(s => s.bg(alpha(t.accent, 0.08)))
+                  .when(busy, e2 => e2.opacity(0.5))
+                  .on_click((_e, cx) => this.choose(it, o, cx))
+                  .child(div().flex_none().w(18).text_size(TYPE.ui).font_semibold().text_color(t.accent).child(`${o.n}.`))
+                  .child(div().flex_1().min_w(0).text_size(TYPE.ui).line_height(1.4).text_color(t.foreground).child(o.text)),
+              ),
+            ),
+        ),
+      )
       .child(
         row()
           .gap(SP.sm)
@@ -440,25 +492,12 @@ export class ReviewView {
     return v_flex()
       .gap(SP.sm)
       .child(
-        row()
-          .items_center()
-          .gap(SP.sm)
-          .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("Work done"))
-          .child(div().text_size(TYPE.ui).text_color(t.muted).child(`${list.length} to look over · nothing is sent unless you add a note`))
-          .child(div().flex_1())
-          .when(list.length > 1, el =>
-            el.child(
-              div()
-                .id("rv-ackall")
-                .text_size(TYPE.ui)
-                .text_color(t.accent)
-                .cursor_pointer()
-                .hover(s => s.underline())
-                .tooltip("Marks every item looked over. Nothing is sent to the org.")
-                .on_click((_e, cx) => this.ackAll(cx))
-                .child("Mark all looked over"),
-            ),
-          ),
+        sectionHead(t, {
+          level: "title",
+          title: "Work done",
+          hint: `${list.length} to look over · nothing is sent unless you add a note`,
+          right: list.length > 1 ? linkBtn(t, "rv-ackall", "Mark all looked over", cx => this.ackAll(cx), { tooltip: "Marks every item looked over. Nothing is sent to the org." }) : null,
+        }),
       )
       .child(
         v_flex().children(
@@ -475,7 +514,7 @@ export class ReviewView {
                   .py(10)
                   .gap(SP.md)
                   .items_center()
-                  .child(div().w(64).flex_none().text_size(TYPE.meta).text_color(t.muted).child(ago(it.createdAt, now)))
+                  .child(timeAgo(t, it.createdAt, now, { w: 64 }))
                   .child(icon("circle-check", 13, onDeck ? t.accent : ok(t)))
                   .child(
                     div()
@@ -502,7 +541,7 @@ export class ReviewView {
                     .pl(64 + SP.md + 13 + SP.md)
                     .pb(SP.md)
                     .gap(SP.sm)
-                    .when(!!body, e2 => e2.child(mdBlock(t, `rv-done-md-${it.id}`, body, { maxW: 680, size: TYPE.ui })))
+                    .when(!!body, e2 => e2.child(mdBlock(t, `rv-done-md-${it.id}`, structure(body), { maxW: 680, size: TYPE.ui })))
                     .when((it.links ?? []).length > 0, e2 => e2.child(this.evidence(t, it))),
                 ),
               );
@@ -517,18 +556,17 @@ export class ReviewView {
     return v_flex()
       .gap(SP.sm)
       .child(
-        h_flex()
-          .id("rv-history-toggle")
-          .gap(6)
-          .items_center()
-          .cursor_pointer()
-          .on_click((_e, cx) => {
+        sectionHead(t, {
+          id: "rv-history-toggle",
+          level: "title",
+          title: "History",
+          hint: `${list.length} decided`,
+          open: this.history,
+          onToggle: cx => {
             this.history = !this.history;
             cx.notify();
-          })
-          .child(icon(this.history ? "chevron-down" : "chevron-right", 12, t.muted))
-          .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("History"))
-          .child(div().text_size(TYPE.ui).text_color(t.muted).child(`${list.length} decided`)),
+          },
+        }),
       )
       .when(this.history, el =>
         el.child(
@@ -553,7 +591,7 @@ export class ReviewView {
                       expanded ? this.open.delete(it.id) : this.open.add(it.id);
                       cx.notify();
                     })
-                    .child(div().w(64).flex_none().text_size(TYPE.meta).text_color(t.muted).child(ago(d.at, now)))
+                    .child(timeAgo(t, d.at, now, { w: 64 }))
                     .child(div().w(96).flex_none().child(chip(t, v.word, v.color(t))))
                     .child(div().flex_1().min_w(0).truncate().text_size(TYPE.ui).text_color(t.foreground).child(plain(it.title)))
                     .child(div().flex_none().text_size(TYPE.meta).text_color(!d.delivered && !d.silent ? t.blocked : t.muted).child(sent)),
@@ -568,6 +606,17 @@ export class ReviewView {
                       .when(!!d.note, e3 => e3.child(div().text_size(TYPE.body).line_height(1.5).text_color(t.foreground).child(`“${d.note}”`)))
                       .when(!d.delivered && !d.silent, e3 =>
                         e3.child(div().child(btn(t, `rv-retry-${it.id}`, "Retry sending", cx => this.app.act(cx, "deliver", ["deliver"], { fail: "Couldn't send" }), { size: "sm" }))),
+                      )
+                      .when(it.kind !== "done", e3 =>
+                        e3.child(
+                          div().child(
+                            btn(t, `rv-reopen-${it.id}`, "Reopen", cx => this.app.act(cx, `reopen-${it.id}`, ["reopen", it.id], { done: "Back in your inbox", fail: "Couldn't reopen" }), {
+                              size: "sm",
+                              icon: "undo",
+                              tooltip: "Put it back in your inbox, unanswered",
+                            }),
+                          ),
+                        ),
                       ),
                   ),
                 );

@@ -2,11 +2,11 @@
 // the master's headline, a lede in plain sentences, then what needs them, what landed, what
 // each manager is on, what the org learned, and how the day went. The data is `hq brief`.
 
-import { h_flex, v_flex } from "gpui-base";
+import { v_flex } from "gpui-base";
 import { div } from "gpui-kit";
 
 import { openLink } from "./shared/viewer-link.js";
-import { ago, alpha, btn, chip, clip, icon, kbd, mono, ok, row, scrollY, SP, statusGlyph, statusLook, TYPE, tint } from "./ui.js";
+import { ago, alpha, btn, clip, clock, empty, icon, inTime, linkBtn, loading, mono, ok, plain, row, scrollY, sectionHead, segmented, SP, statusBadge, statusGlyph, timeAgo, tint, toolbar, TYPE } from "./ui.js";
 
 const SEEN = "brief.seen";
 const HOUR = 3600_000;
@@ -20,28 +20,20 @@ const RANGES = [
 const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-const pad = n => String(n).padStart(2, "0");
-const hhmm = ms => {
-  const d = new Date(ms);
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
 const dayWord = ms => {
   const d = new Date(ms);
   return `${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}`;
 };
-/** Prose from agent text: no markdown marks, one line. */
-const plain = s => (s ?? "").replace(/\*\*|`|__/g, "").replace(/\s+/g, " ").trim();
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 /** "3 working, 2 idle and 1 gone" */
 const listing = parts => (parts.length < 2 ? parts.join("") : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`);
 const cap = s => (s ? s[0].toUpperCase() + s.slice(1) : s);
-/** The first sentence of agent prose, plain; long ones are cut at a word with the rest in a tooltip. */
+/** The first sentence of agent prose, plain; long ones are clipped, with the rest in a tooltip. */
 const first = (s, max = 200) => {
   const p = plain(s).replace(/^\(([\w-]+), \d{4}-\d\d-\d\d\)\s*/, "");
   if (!p) return "";
   const m = /^(.+?[.!?])(\s|$)/.exec(p);
-  const one = m ? m[1] : p;
-  return one.length > max ? `${one.slice(0, max).replace(/\s+\S*$/, "")}…` : one;
+  return clip(m ? m[1] : p, max);
 };
 
 export class BriefView {
@@ -175,53 +167,19 @@ export class BriefView {
       .child(
         this.data
           ? scrollY("brief-scroll", v_flex().items_center().px(32).pt(32).pb(64).child(this.column(t)))
-          : v_flex()
-              .flex_1()
-              .items_center()
-              .justify_center()
-              .gap(6)
-              .child(div().text_size(TYPE.body).text_color(this.error ? t.blocked : t.muted).child(this.error ? "Couldn't write the brief" : "Writing the brief…"))
-              .when(!!this.error, el => el.child(div().max_w(520).text_size(TYPE.meta).text_color(t.dim).child(this.error))),
+          : this.error
+            ? empty(t, "Couldn't write the brief", this.error, { icon: "alert", tone: t.blocked, action: btn(t, "brief-retry", "Retry", cx => this.load(cx), { size: "sm" }) })
+            : loading(t, "Writing the brief…"),
       );
   }
 
   toolbar(t) {
-    return h_flex()
-      .flex_none()
-      .h(44)
-      .px(16)
-      .gap(10)
-      .items_center()
-      .border_b(1)
-      .border_color(alpha(t.border, 0.7))
-      .child(
-        h_flex()
-          .p(3)
-          .gap(2)
-          .rounded(8)
-          .bg(alpha(t.foreground, 0.055))
-          .children(
-            RANGES.map(r => {
-              const on = this.range === r.id;
-              return div()
-                .id(`brief-range-${r.id}`)
-                .h(24)
-                .px(10)
-                .flex()
-                .items_center()
-                .rounded(6)
-                .text_size(TYPE.ui)
-                .cursor_pointer()
-                .when(on, el => el.bg(t.background).text_color(t.foreground).font_medium().shadow_sm())
-                .when(!on, el => el.text_color(t.muted).hover(s => s.text_color(t.foreground)))
-                .on_click((_e, cx) => this.setRange(r.id, cx))
-                .child(r.label);
-            }),
-          ),
-      )
-      .child(div().flex_1())
-      .when(this.loading, el => el.child(div().text_size(TYPE.meta).text_color(t.dim).child("updating…")))
-      .child(btn(t, "brief-read", "Mark as read", cx => this.markRead(cx), { size: "sm", icon: "check", kbd: "M" }));
+    return toolbar(t, [
+      segmented(t, "brief-range", RANGES, this.range, (id, cx) => this.setRange(id, cx)),
+      div().flex_1(),
+      ...(this.loading ? [div().text_size(TYPE.meta).text_color(t.muted).child("updating…")] : []),
+      btn(t, "brief-read", "Mark as read", cx => this.markRead(cx), { size: "sm", icon: "check", kbd: "M" }),
+    ]);
   }
 
   column(t) {
@@ -247,7 +205,7 @@ export class BriefView {
     const said = own ? null : first(d.master?.said, 180);
     return v_flex()
       .gap(SP.md)
-      .child(div().text_size(TYPE.meta).text_color(t.muted).child(`${dayWord(d.now)} · ${sinceWord}, from ${hhmm(d.since)}`))
+      .child(div().text_size(TYPE.meta).text_color(t.muted).child(`${dayWord(d.now)} · ${sinceWord}, from ${clock(d.since)}`))
       .child(
         div()
           .id("brief-headline")
@@ -291,22 +249,13 @@ export class BriefView {
       );
     const loop = d.loop;
     if (loop && !loop.stopped && loop.wakeAt)
-      out.push(loop.wakeAt > d.now ? `The master's next tick is ${ago(2 * d.now - loop.wakeAt, d.now).replace(" ago", "").replace("just now", "under a minute")} away.` : "The master's tick is overdue.");
+      out.push(loop.wakeAt > d.now ? `The master's next tick is ${inTime(loop.wakeAt, d.now)}.` : "The master's tick is overdue.");
     else out.push("The master isn't looping right now.");
     return out.join(" ");
   }
 
   head(t, title, count) {
-    return row()
-      .mt(36)
-      .pt(SP.lg)
-      .pb(SP.sm)
-      .gap(SP.sm)
-      .items_center()
-      .border_t(1)
-      .border_color(alpha(t.border, 0.8))
-      .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child(title))
-      .when(count != null, el => el.child(div().text_size(TYPE.ui).text_color(t.muted).child(String(count))));
+    return div().mt(36).pt(SP.lg).pb(SP.sm).border_t(1).border_color(alpha(t.border, 0.8)).child(sectionHead(t, { level: "title", title, count }));
   }
 
   /** A manager's id for a terminal address, so rows say "wrappers", not "t77". */
@@ -324,7 +273,7 @@ export class BriefView {
       .gap(12)
       .items_start()
       .rounded(8)
-      .when(on, el => el.bg(alpha(t.accent, 0.1)))
+      .when(on, el => el.bg(tint(t).on))
       .when(!!o.tooltip, el => el.tooltip(o.tooltip))
       .when(!!o.open, el => el.cursor_pointer().hover(s => s.bg(tint(t).hover)).on_click((_e, cx) => o.open(cx)))
       .children(children);
@@ -406,17 +355,13 @@ export class BriefView {
 
   more(t, id, open, n, what, toggle) {
     return div()
-      .id(id)
       .py(SP.xs)
-      .text_size(TYPE.ui)
-      .text_color(t.accent)
-      .cursor_pointer()
-      .hover(s => s.underline())
-      .on_click((_e, cx) => {
-        toggle();
-        cx.notify();
-      })
-      .child(open ? "Show fewer" : `Show all ${n} ${what}`);
+      .child(
+        linkBtn(t, id, open ? "Show fewer" : `Show all ${n} ${what}`, cx => {
+          toggle();
+          cx.notify();
+        }),
+      );
   }
 
   inFlight(t) {
@@ -426,7 +371,6 @@ export class BriefView {
       .children(
         this.managers().map(m => {
           const status = m.live ? m.status : "gone";
-          const look = statusLook(status, t);
           // "doing" is a tool line; only a phrase ("Record the fresh build") reads as news.
           const phrase = /\s\S+\s/.test(plain(m.doing)) ? m.doing : null;
           const working = m.status === "working" && !!phrase;
@@ -435,7 +379,7 @@ export class BriefView {
             t,
             `mgr-${m.id}`,
             [
-              div().pt(4).child(statusGlyph(status, t, 12)),
+              div().pt(4).child(statusGlyph(status, t, 12, { still: this.app.palette?.open })),
               v_flex()
                 .flex_1()
                 .min_w(0)
@@ -445,9 +389,9 @@ export class BriefView {
                     .gap(SP.sm)
                     .items_center()
                     .child(div().text_size(TYPE.body).font_semibold().text_color(t.foreground).child(m.name))
-                    .child(div().text_size(TYPE.meta).text_color(look.color).child(look.label))
+                    .child(statusBadge(t, status, { glyph: false, text: TYPE.meta }))
                     .child(div().flex_1())
-                    .child(div().text_size(TYPE.meta).text_color(t.muted).child(m.lastAt ? ago(m.lastAt, d.now) : "")),
+                    .child(timeAgo(t, m.lastAt, d.now)),
                 )
                 .when(!!now, el => el.child(div().text_size(TYPE.body).line_height(1.5).text_color(t.foreground).child(`${working ? "Now: " : ""}${now}`)))
                 .when(!!m.goal, el => el.child(div().text_size(TYPE.ui).line_height(1.45).text_color(t.muted).child(first(m.goal, 160)))),
@@ -472,7 +416,7 @@ export class BriefView {
             .tooltip(plain(l.text))
             .child(div().w(84).flex_none().pt(1).truncate().text_size(TYPE.ui).font_medium().text_color(t.foreground).child(this.nameOf(l.peer)))
             .child(div().flex_1().min_w(0).text_size(TYPE.body).line_height(1.5).text_color(t.foreground).child(first(l.text, 220)))
-            .child(div().flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(ago(l.at, d.now))),
+            .child(timeAgo(t, l.at, d.now).pt(1)),
         ),
       )
       .when(d.lessons.length > 5, el => el.child(this.more(t, "brief-lessons-more", this.allLessons, d.lessons.length, "lessons", () => (this.allLessons = !this.allLessons))))
@@ -492,7 +436,7 @@ export class BriefView {
                 row()
                   .gap(SP.md)
                   .items_center()
-                  .child(div().w(84).flex_none().text_size(TYPE.meta).text_color(t.muted).child(hhmm(c.at)))
+                  .child(div().w(84).flex_none().text_size(TYPE.meta).text_color(t.muted).child(clock(c.at)))
                   .child(div().flex_1().min_w(0).text_size(TYPE.ui).text_color(c.dream ? t.foreground : t.muted).child(c.subject))
                   .when(c.dream, el => el.child(icon("sparkles", 12, t.accent))),
               ),
@@ -518,7 +462,7 @@ export class BriefView {
         events.map((e, i) =>
           row()
             .gap(14)
-            .child(div().w(44).flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(hhmm(e.at)))
+            .child(div().w(44).flex_none().pt(1).text_size(TYPE.meta).text_color(t.muted).child(clock(e.at)))
             .child(
               v_flex()
                 .flex_none()
@@ -542,21 +486,15 @@ export class BriefView {
   }
 
   quiet(t) {
-    return v_flex()
+    return div()
       .mt(40)
-      .pt(16)
-      .gap(8)
-      .border_t(1)
-      .border_color(alpha(t.border, 0.8))
-      .child(div().text_size(TYPE.title).font_semibold().text_color(t.foreground).child("A quiet stretch"))
       .child(
-        div()
-          .text_size(14)
-          .line_height(1.6)
-          .text_color(t.muted)
-          .child(
-            "Nothing landed and nothing waits for you in this window. The Brief fills as the org works: headlines, merged PRs, your decisions and new lessons. Try a longer range above.",
-          ),
+        empty(
+          t,
+          "A quiet stretch",
+          "Nothing landed and nothing waits for you in this window. The Brief fills as the org works: headlines, merged PRs, your decisions and new lessons. Try a longer range above.",
+          { icon: "circle-check", tone: ok(t), framed: true },
+        ),
       );
   }
 }

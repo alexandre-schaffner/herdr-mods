@@ -2,6 +2,14 @@
 the next moves, the live map, and what's going on now. `hq` is for agents; the HQ mod calls it
 too. The repository is the one the current folder belongs to unless `--repo <folder>` says so.
 
+The master's mailbox (managers and workflow owners: write to the master here, not with hc send):
+  hq tell "<message>" [--urgent]   it reads mail on its tick; urgent mail (or what Jev judges
+                                   can't wait an hour) wakes it. `hq mail [--all]` lists it.
+
+The loop runner (a Haiku session that runs the master's tick; `hq runner` shows it):
+  hq escalate --title T --body-file F [--urgent]   hand the master what needs its judgment (BLUF, then SBAR)
+  hq escalations [--all]           what was escalated, delivered or waiting
+
 The person (talk to the master):
   hq ask approval --title T --body B --action "<exact command>" [--link URL]...
                                    an outward-facing action that waits for a yes (HQ > Review)
@@ -46,7 +54,14 @@ relayed; the owner files `hq workflow-report <id> ...`. `hq workflows help` has 
 
 Keeping the picture current:
   hq status "<one line>"           the headline in HQ's status strip
-  hq tick                          what changed since the last tick (decisions, steering, signals)
+  hq tick                          what changed since the last tick (mail, decisions, steering, signals),
+                                   then your loop's steps due this tick (a manager gets its own digest)
+  hq loop show|arm|pause|resume|run|reset [agent]   an agent's loop (HQ > Org > Loops edits it);
+                                   `hq loops` is the live view as JSON
+  hq watch add "<what>" --check '<cmd>' [--every 10m] [--for 1d] [--note N]   wait on CI, a merge,
+                                   a reply: HQ runs the check (exit 0 = it happened, 1 = not yet) and
+                                   sends you one HQ WATCH line when it fires. `hq watch` lists yours;
+                                   `hq watch help` has the rest
   hq lens | lens seed | lens set <file>   the live map (PR Lens graph) shown in HQ > Map
   hq roadmap | roadmap seed | roadmap set <file> | roadmap drop <epic>   your epics' plans in phases (HQ > Roadmap)
   hq handoff                       the master's handoff file (path)
@@ -83,6 +98,11 @@ import workflow_owners as wfo  # noqa: E402
 import roadmap as rmap  # noqa: E402
 import merge_queue as mq  # noqa: E402
 import hcguard as guard  # noqa: E402
+import answer_guard  # noqa: E402
+import mail as mbox  # noqa: E402
+import loops  # noqa: E402
+import watches  # noqa: E402
+import runner  # noqa: E402
 
 
 def H():
@@ -94,6 +114,9 @@ MEMORY = os.path.join(HOME, "agent-memory")
 DREAM_SH = os.path.join(HOME, ".local/share/agent-memory-dream/dream.sh")
 DREAM_LOG = os.path.join(HOME, ".local/state/agent-memory-dream/dream.log")
 MASTER_PROMPT = os.path.join(APP, "mods", "master", "master.md")
+# How every agent in every org writes (HQ > Prompts > Communication style); one file for all repos.
+STYLE = os.path.join(APP, "data", "hq", "communication.md")
+RUNNER_PROMPT = os.path.join(APP, "mods", "master", "runner.md")
 WORKTREES = os.path.join(HOME, ".herdr", "worktrees")
 MASTER_LABEL = registry.LABEL
 MANAGER_LABEL = "herdr.hq.manager"
@@ -103,15 +126,29 @@ MASTER_PY = os.path.join(APP, "mods", "master", "master.py")
 POTETO = "/pstack:poteto-mode"  # every manager session starts in poteto mode
 TAIL = 3_000_000
 NOW = lambda: int(time.time() * 1000)  # noqa: E731
+HANDOFF_MAX = 8_000  # bytes: a bigger master handoff is re-read whole after every compaction
+MERGE_QUEUE_MODEL = "sonnet"  # a merge queue runs scripts and batches: no Opus needed unless the manager sets one
 
 DEFAULT_SETTINGS = {
     "autoRearm": True,          # type the loop back in when the master's loop has lapsed
     "autoCompactMaster": True,  # /compact the master when idle and over the line below
-    "masterCompactAt": 600_000,
-    "managerWarnAt": 400_000,   # context size a manager's card turns amber at
+    "masterCompactAt": 250_000,  # median master context ran ~300k: compact sooner (handoff-gated)
+    "runner": True,             # a loop runner session runs the master's tick and escalates (runner.py)
+    "runnerModel": "haiku",     # the runner's model, at its next start
+    "runnerCompactAt": 140_000, # /compact an idle runner over this (its state lives in HQ; ~60k is its bare start)
+    "managerWarnAt": 180_000,   # context size a manager's card turns amber at
+    "autoCompactManagers": True,  # /compact an idle manager over the line below, from a fresh ## Handoff
+    "managerCompactAt": 220_000,
     "quietMinutes": 25,         # working with no transcript write for this long: quiet
     "idleMinutes": 45,          # a manager idle this long with a handoff: idle signal
     "dreamEvery": 10,           # memory commits since the last Dream before the master dreams
+    "heartbeatSec": 3600,       # the master's idle tick: HQ's gate wakes it sooner when something can't wait
+    "wakeGate": True,           # wake an idle master for urgent mail, steering, managers gone or waiting
+    "jev": True,                # let Jev (TypeSafe, TYPESAFE_API_KEY) judge mail urgency and waiting managers
+    "jevThreshold": 0.6,        # Jev's yes above which mail wakes the master
+    "waitThreshold": 0.7,       # Jev's yes above which an idle manager counts as waiting on the master
+    "freeUnits": True,          # end managers' unit sessions that finished and sat idle (free_units)
+    "unitIdleMinutes": 30,      # how long a finished unit sits idle before it's ended
 }
 
 DEFAULT_POLICY = """# What needs the person's approval
@@ -137,6 +174,52 @@ apply at once. Keep the org lean: one merge-queue manager per epic that ships PR
 --group <epic> --trunk <branch>`), one manager per area of focus.
 """
 
+DEFAULT_STYLE = """# Communication style
+
+The person's rules for how every agent writes: the master, managers, their unit sessions and
+workflow owners, in every repository. They win over any brief. Each text you write falls under
+exactly one of the three registers below; when unsure, use the general one.
+
+## 1. General messages: bro style
+Write the way the `pstack:bro` skill asks: plain human language, no jargon, coherent, simple and
+short, like one human talking to another. Lead with the point. Name things the person knows
+(the PR, the feature) instead of internal ids, and explain any term they might not know.
+(`pstack:bro` can't be called as a skill by an agent: apply its rule directly.)
+
+Applies to: chat answers to the person, `hq tell`, `hq ask` and `hq done` bodies, to-do titles
+and notes, `LESSON:` lines, messages between a manager and its units.
+
+## 2. Observability: ASD-STE100 Simplified Technical English
+Text that records or shows the state of the work follows ASD-STE100:
+- Use approved, simple words with one meaning each. Use the same word for the same thing every time.
+- Keep sentences short: a maximum of 20 words for steps, 25 words for descriptions.
+- Write one instruction or one fact per sentence. Write steps as a numbered list, in the imperative.
+- Use the active voice and simple tenses (past, present, future). Do not use "-ing" forms as verbs.
+- Keep "the", "a" and "this". Do not make noun clusters of more than 3 words.
+- Give a paragraph a maximum of 6 sentences. Put warnings and cautions first.
+- Write numbers as digits, with their units. Give the exact names of PRs, branches, commands and files.
+
+Applies to: `hq status` headlines, the Home update, the live map and roadmap labels and notes,
+`hq watch` descriptions, progress and state sections of report files, logs and audit notes.
+
+## 3. Handovers: BLUF, then SBAR
+Any text that passes work to another session (or to your own next session) opens with a
+**BLUF** (bottom line up front): one sentence that gives the result, the state, or the request.
+When the reader needs more context to act, add a concise SBAR under it, with these four
+headings in this order (skip SBAR when the BLUF is enough):
+- **Situation**: what is happening now, in 1 or 2 sentences.
+- **Background**: the goal, what was done, open PRs with their heads, decisions already made.
+- **Assessment**: your reading of the state: what is verified, what is not, the risks.
+- **Recommendation**: the next steps in order, what to do first, open questions and who answers them.
+
+Applies to: the master's handoff file, each manager's `## Handoff` section in its report (keep the
+`## Handoff` heading, put the BLUF and the SBAR headings under it), unit briefs and a unit's final
+report to its manager, `hq workflow-report` bodies, escalations to the master, and any `hq tell`
+that hands work over. Write the BLUF and the SBAR text in the observability register (2).
+
+Managers: put this file's path in every unit brief, and tell the unit to follow it.
+"""
+
 DEFAULT_BASE = """You are a manager in {repo}'s org. The master chat ({master}) oversees you; the
 person reviews your work through Herdr's HQ panel (the `hq` skill explains it: run `hq` for the
 reference). Use `hq ask` / `hq done` to reach the person; changing the org or the master's next
@@ -157,6 +240,13 @@ Code work goes to `pstack:poteto-agent` subagents or unit sessions started with
 - Run your team as subagents or as unit sessions in sibling worktrees
   (`~/.herdr/worktrees/{repo_dir}/{id}-<unit>`); label unit terminals
   `hc label <t> {label}={id}` so HQ shows them under you.
+- Open every unit's brief with this paragraph, your terminal filled in: "You are a unit session
+  of the manager `{id}` (terminal <yours>) in {repo}'s org, which the person supervises from
+  Herdr's HQ. Ask your manager, never the master or the person: `hc send <its terminal> ...`. Keep
+  everything worth keeping in your report file; when your brief is done, say so in one line and
+  stop. HQ ends a unit session that has finished and sat idle a while."
+- A unit session costs memory and a tab while it waits. Once you have its report, end it
+  (`hc kill <t>`); for a follow-up, start a fresh unit from the brief and its report.
 - Keep a `## Handoff` section at the top of `.audit/{id}/report.md` (goal, state, open PRs and
   heads, team in flight, next steps, decisions, pending questions). Update it at each wave end,
   each READY and before each long wait. If your session is replaced, the next one starts from it.
@@ -164,12 +254,42 @@ Code work goes to `pstack:poteto-agent` subagents or unit sessions started with
   `hq ask approval --title ... --body ... --action ...`; wait for the `HQ DECISION` message.
   Questions only the person can answer: `hq ask question`. Finished work worth a look:
   `hq done --title ... --body ... --link <pr>`.
-- Report to the master with `hc send {master} "<message>"` when you are blocked, change
-  plans, or finish a phase. Send `LESSON: ({id}, <date>) ...` lines as you learn them.
+- Report to the master with `hq tell "<message>"` when you are blocked, change plans, or
+  finish a phase; add `--urgent` when you are stopped until it answers. It reads its mail on
+  its tick, so don't send chatter, and don't type into its terminal: the person talks to it
+  there. Send `LESSON: ({id}, <date>) ...` lines the same way as you learn them.
+
+## Your headquarters (HQ)
+HQ shows the person your status, what you last said and did, your context size, your team, your
+report's Handoff and what you filed. It also acts on its own, so work with it:
+- **Your loop.** If the person gives you a loop in HQ, it arrives as `/loop hq tick for your HQ
+  loop`. Each tick run `hq tick` and read all of it, untrimmed: it lists your due steps first,
+  then your decisions, open asks and team. Do the steps in order as their text says; the last
+  one is the heartbeat (ScheduleWakeup, or stop when it or a paused loop says so). The person
+  edits the steps in HQ, so follow the list, not memory. An `HQ LOOP:` line can pause or change it.
+- **Decisions and HQ's lines** arrive typed into your terminal: `HQ DECISION <id> ...` (do
+  exactly what was approved) and `HQ: ...` (act on it). `HQ TICK: ...` asks for a tick now.
+- **Waiting.** To wait on CI, a merge, a review or a reply, use `hq watch add "<what>" --check '<cmd>'`
+  (the check exits 0 when it happened, 1 while not yet): HQ runs it and sends you one
+  `HQ WATCH [id]: ...` line when it fires, so end your turn and spend nothing meanwhile. Your own
+  background command or Monitor is fine for what only your session can see (a local build, a
+  log); HQ shows those too. `hq watch` lists yours.
+- **Mail.** An `hc send` from you to the master is rerouted to its mailbox, like `hq tell`.
+- **Walls.** `hc` into another org's terminals is refused; stay in your org.
+- **Unit sessions.** HQ ends your units once they have finished and sat idle a while (Prompts >
+  Autopilot), so a unit's state belongs in its report, never only in its session.
+- **Context.** HQ flags you when your context grows large; the master may compact you (`hq
+  compact`) or respawn you when idle, and a respawned session continues from your Handoff.
+- **Answers.** When the person writes to you directly, answer in text before any wakeup call:
+  a Stop hook sends a turn the person started back to you once if it ends without an answer.
+- **Who wins.** The person's own words (their messages, the standing orders, your loop's steps,
+  the policy) win over this brief; the more specific and recent of theirs wins. If unsure, ask.
 
 ## Memory
-Read `~/agent-memory/MEMORY.md` and `~/agent-memory/projects/{repo_dir}.md` at the start and
-before each wave. They are read-only for you: the master is the only writer.
+At the start (and after a compaction) read `~/agent-memory/MEMORY.md`. Don't read the project
+memory whole (it is large): `grep -rn -i '<words for your area or task>' ~/agent-memory/projects/`
+and read only the sections that match; grep again before a wave for what it touches. Memory is
+read-only for you: the master is the only writer.
 """
 
 DEFAULT_ROSTER = [
@@ -177,7 +297,7 @@ DEFAULT_ROSTER = [
      "notes": "Builds and compiles only; no individual test runs."},
     {"role": "advisor", "model": "opus", "effort": "xhigh", "count": 1,
      "notes": "Briefs the wave, runs all tests in one batch once every implementer is back, fixes failures itself."},
-    {"role": "verifier", "model": "opus", "effort": "xhigh", "count": 1,
+    {"role": "verifier", "model": "opus", "effort": "high", "count": 1,
      "notes": "Fresh eyes on the three-dot diff; every safety claim backed by a test."},
 ]
 
@@ -264,13 +384,14 @@ def repo_base(folder=None):
         r = repo_of(cwd)
         masters = claude.masters()
         # The focused space's repo when its master runs, else the newest master that runs,
-        # else the newest master at all.
+        # else the newest master at all. A folder outside git (home, say) is only a repo while
+        # its master runs: a stopped one there must not take HQ over from a real repository's.
         cands = ([r] if r and r["key"] in masters else []) + [repo_of(m["path"]) for k, m in sorted(masters.items(), key=lambda x: x[1].get("startedAt") or 0, reverse=True) if m.get("path") and not registry.parse_key(k)[1]]
         cands = [c for c in cands if c]
         for c in cands:
             if master_terminal(c)[0]:
                 return c
-        return (cands or [r])[0] or fail("no repository here")
+        return ([c for c in cands if c["key"] != c["path"]] or cands or [r])[0] or fail("no repository here")
     folder = os.path.realpath(os.path.expanduser(folder or os.environ.get("HQ_REPO") or os.getcwd()))
     r = repo_of(folder)
     if not r:
@@ -299,6 +420,8 @@ def paths(repo):
         "managers": os.path.join(d, "managers"),
         "owner": os.path.join(d, "workflow-owner.md"),
         "master": MASTER_PROMPT,
+        "style": STYLE,
+        "runner": RUNNER_PROMPT,
     }
 
 
@@ -306,7 +429,7 @@ def ensure(repo):
     p = paths(repo)
     os.makedirs(p["inbox"], exist_ok=True)
     os.makedirs(p["managers"], exist_ok=True)
-    for key, text in (("policy", DEFAULT_POLICY), ("orders", DEFAULT_ORDERS), ("base", DEFAULT_BASE)):
+    for key, text in (("policy", DEFAULT_POLICY), ("orders", DEFAULT_ORDERS), ("base", DEFAULT_BASE), ("style", DEFAULT_STYLE)):
         if not os.path.exists(p[key]):
             write(p[key], text)
     return p
@@ -428,6 +551,7 @@ def status_of(t):
 
 
 _masters = {}
+_runners = {}  # runner.terminal's cache
 
 
 def master_terminal(repo):
@@ -451,6 +575,13 @@ def master_record(repo, facts=False, **opts):
     if facts and sid:
         rec["facts"] = session_facts(sid, repo["path"], **opts)
     rec["loop"] = loop_state(rec["facts"].get("loop"), rec["status"]) if rec["terminal"] else {"state": "gone"}
+    rec["loopTerminal"], rec["loopFacts"] = rec["terminal"], rec["facts"]
+    # With a loop runner, the loop HQ watches, wakes and re-arms is the runner's, not the master's.
+    r = guarded(runner.record, None, H(), repo, facts) if rec["terminal"] else None
+    if r:
+        rec["runner"] = {k: v for k, v in r.items() if k != "facts"}
+        rec["loopTerminal"], rec["loopFacts"] = r["terminal"], r["facts"]
+        rec["loop"] = loop_state(r["facts"].get("loop"), r["status"])
     return rec
 
 
@@ -655,7 +786,7 @@ def new_id():
 
 def who_am_i(repo):
     """The terminal this command runs in (HERDR_TERMINAL or the lineage), and its role."""
-    addr = os.environ.get("HC_TERMINAL") or os.environ.get("HERDR_TERMINAL")
+    addr = os.environ.get("HC_TERMINAL") or os.environ.get("HC_TERMINAL_ID") or os.environ.get("HERDR_TERMINAL")
     if not addr:
         mine = set(claude.lineage(os.getpid()))
         for t in hc_ls():
@@ -671,6 +802,9 @@ def who_am_i(repo):
         for m in org(repo)["managers"]:
             if m.get("terminal") == addr:
                 role = m["id"]
+        rt = runner.terminal(H(), repo) if not role else None
+        if rt and rt.get("address") == addr:
+            role = "runner"
         role = role or wfo.role_of(H(), repo, addr)
     return {"terminal": addr, "role": role}
 
@@ -756,9 +890,8 @@ def cmd_reopen(repo, item_id):
     it.setdefault("history", []).append({"reopenedAt": NOW(), "was": prev})
     write_json(path, it)
     log_activity(repo, "decision", f"Reopened: {it['title']}", id=item_id, by="person")
-    mt, _ = master_terminal(repo)
-    if mt and (prev or {}).get("verdict") in ("dismiss", "resolved"):
-        hc(["send", mt["address"], f"HQ: the person reopened {item_id} ('{it['title']}'), which had been {'dismissed' if prev['verdict'] == 'dismiss' else 'resolved'}. It's open again in their inbox; treat it as unanswered and wait for their decision."], repo, timeout=25)
+    if (prev or {}).get("verdict") in ("dismiss", "resolved"):
+        mbox.tell(H(), repo, f"HQ: the person reopened {item_id} ('{it['title']}'), which had been {'dismissed' if prev['verdict'] == 'dismiss' else 'resolved'}. It's open again in their inbox; treat it as unanswered and wait for their decision.", frm=HQ_FROM)
     out({"ok": True})
 
 
@@ -773,6 +906,7 @@ def decision_text(it):
     return head
 
 
+HQ_FROM = {"role": "hq", "terminal": None}  # mail HQ itself files for the master
 DELIVERY_TRIES = 20  # about 20 minutes of autopilot retries, then it waits for the person
 
 
@@ -810,8 +944,8 @@ def deliver_one(repo, it, path):
     code, so, se = hc(["send", primary, text if asker else f"{text} (its asker is gone: pass it on)"], repo, timeout=25)
     ok = code == 0
     if ok and asker and master_addr and asker != master_addr and not d.get("copied"):
-        c, _, _ = hc(["send", master_addr, f"FYI {text} (sent to {asker})"], repo, timeout=25)
-        d["copied"] = c == 0
+        mbox.tell(H(), repo, f"FYI {text} (sent to {asker})", frm=HQ_FROM)
+        d["copied"] = True
     d.update(delivered=ok, sending=None, tries=d.get("tries", 0) + 1,
              error=None if ok else f"{primary}: {(se or so).strip()[-160:]}")
     if ok:
@@ -1022,7 +1156,15 @@ def compose_brief(repo, m):
     charter = read(charter_path(repo, m["id"]), "").strip() or "(No charter yet: ask the master what to work on.)"
     queue = queue_brief(repo, m) if m.get("kind") == "merge-queue" else ""
     return (f"# Manager brief: {m.get('name') or m['id']}\n\nYou are `{m['id']}`, the manager of {kind}.\n\n"
-            f"## Charter\n{charter}\n\n{queue}## Your team\n{team}\n\n{base.strip()}\n")
+            f"## Charter\n{charter}\n\n{queue}## Your team\n{team}\n\n{base.strip()}\n\n{style_section()}")
+
+
+def style_section():
+    """The person's communication style, for a brief: its text now, and where to re-read it."""
+    text = (read(STYLE, "") or DEFAULT_STYLE).strip()
+    text = re.sub(r"^# .*\n+", "", text)
+    return (f"## How you write\n_From {STYLE}. Re-read it when `hq tick` says it changed._\n\n"
+            + re.sub(r"(?m)^## ", "### ", text) + "\n")
 
 
 def queue_brief(repo, m):
@@ -1050,6 +1192,7 @@ def queue_brief(repo, m):
         lines.append(f"- Start from the `{ref[0]['id']}` queue's engine in `{ref[1]}` (tick.py, scan.py and its report's 'Local merge queue' and 'Handoff' sections for the rules). Copy it into your worktree, then make its paths, trunk, worktree scope and branch prefix yours. Don't edit theirs.")
     else:
         lines.append("- No other queue runs yet: build the engine the way the master describes, one batch in flight at a time, CI once per batch, merge only with the person's approval.")
+    lines.append("- Waiting costs you a full turn per wake. Wait on CI and merges with `hq watch add`, or at most one Monitor whose output is only the lines that need you (green, red, revoked, conflict). Never a Monitor that tails a tick log or prints every queue tick.")
     lines.append("- Same contract as every queue: QUEUED-GREEN / QUEUE-REJECTED / QUEUE-REVOKED lines in your report, approvals through `hq ask`, the master merges.")
     return "\n".join(lines) + "\n\n"
 
@@ -1070,9 +1213,11 @@ def space_for_folder(folder):
 
 def start_manager_tab(repo, m, folder, first):
     """A new tab running the manager's Claude session in its worktree's space."""
-    argv = ["claude", "--permission-mode", "auto", "--name", f"{m['id']} · manager"]
-    if m.get("model"):
-        argv[1:1] = ["--model", m["model"]]
+    # answer_guard: a turn the person started ends with an answer they can see.
+    argv = ["claude", "--permission-mode", "auto", "--settings", answer_guard.settings(), "--name", f"{m['id']} · manager"]
+    model = m.get("model") or (MERGE_QUEUE_MODEL if m.get("kind") == "merge-queue" else None)
+    if model:
+        argv[1:1] = ["--model", model]
     # Its `hq` commands act in its master's scope wherever it runs (a worktree's group can get its
     # own master later; the manager still reports to the master that runs it).
     argv = [*registry.claude_env(repo), *guard.env(repo), *argv]
@@ -1378,6 +1523,7 @@ def cmd_snapshot(repo):
          "merges": guarded(mq.merges_snapshot, {}, H(), repo),
          "queues": guarded(mq.queues_snapshot, [], H(), repo, managers, items),
          "artifacts": art_list(repo),
+         "mail": guarded(mbox.snapshot, {"unread": 0, "items": []}, H(), repo),
          "status": st, "counts": counts,
          "signals": sorted(signals_for(repo, master, managers, items, s) + wf["signals"], key=lambda x: ("alert", "warn", "info").index(x["level"])),
          "inbox": items[:200], "activity": activity(repo)})
@@ -1390,81 +1536,120 @@ def file_hash(path):
 
 
 def cmd_tick(repo):
-    """What changed since the last tick, in a few lines, so the master spends its context on
-    decisions instead of on looking around."""
+    """The master's loop steps due this tick, then what changed since the last one, in a few
+    lines, so the master spends its context on decisions instead of on looking around. Quiet parts stay out: managers whose line didn't
+    change, chores for pages nothing has moved since. A tick with nothing new says so, so the
+    master ends the turn at once."""
     p = ensure(repo)
     s = settings(repo)
     prev = claude.read_json(p["tick"]) or {}
     now = NOW()
     since = prev.get("at") or 0
-    lines = [f"HQ tick {time.strftime('%Y-%m-%d %H:%M')} (last {int((now - since) / 60000) if since else '—'} min ago)"]
-    for key, label in (("orders", "Standing orders"), ("policy", "Approval policy")):
+    # Only the master's tick consumes what's new: a manager or the person running `hq tick`
+    # would otherwise take mail, decisions and to-do notes the master never sees.
+    me = who_am_i(repo)
+    if me["role"] and me["role"] != "master" and any(m["id"] == me["role"] for m in org(repo)["managers"]):
+        return loops.manager_tick(H(), repo, me["role"])
+    has_runner = bool(runner.terminal(H(), repo))
+    # The loop runner owns the tick when it runs; the master reads it only when there is none.
+    mine = me["role"] == "runner" or (me["role"] == "master" and not has_runner) or not me["terminal"]
+    news = []
+    for key, label in (("orders", "Standing orders"), ("policy", "Approval policy"), ("style", "Communication style")):
         h = file_hash(p[key])
         if prev.get(key) and prev[key] != h:
-            lines.append(f"- {label} changed: re-read {p[key]}")
+            news.append(f"- {label} changed: re-read {p[key]}")
         prev[key] = h
+    unread = mbox.items(H(), repo, unread=True)
+    news.extend(mbox.tick_lines(H(), repo, unread))
     items = inbox_items(repo, include_closed=True)
     for it in items:
         d = it.get("decision") or {}
         if d.get("at", 0) > since and not d.get("silent"):
-            lines.append(f"- Decision: {decision_text(it)}")
+            news.append(f"- Decision: {decision_text(it)}")
         elif d.get("at", 0) > since and d.get("verdict") == "dismiss" and it["kind"] in ("approval", "question"):
             asked = (it.get("from") or {}).get("role") or "?"
-            lines.append(f"- Dismissed without a reply (from {asked}): [{it['id']}] {it['title']}. Don't act on it; ask again only if it still matters.")
+            news.append(f"- Dismissed without a reply (from {asked}): [{it['id']}] {it['title']}. Don't act on it; ask again only if it still matters.")
         if it.get("createdAt", 0) > since and (it.get("from") or {}).get("role") != "master":
-            lines.append(f"- Filed by {(it.get('from') or {}).get('role') or (it.get('from') or {}).get('terminal')}: [{it['kind']}] {it['title']}")
-    waiting = [i for i in items if i.get("state") == "open" and i["kind"] in ("approval", "question")]
-    stale = [i for i in waiting if NOW() - (i.get("createdAt") or 0) > 30 * 60_000]
-    if stale:
-        lines.append("- Still open in the person's inbox: " + "; ".join(f"[{i['id']}] {clip(i['title'], 50)}" for i in stale[:4])
-                     + ". If one is settled or moot, close it: `hq resolve <id> \"how it was settled\"`.")
-    if waiting:
-        lines.append(f"- Waiting on the person: {len(waiting)} ({', '.join(clip(i['title'], 50) for i in waiting[:4])})")
+            news.append(f"- Filed by {(it.get('from') or {}).get('role') or (it.get('from') or {}).get('terminal')}: [{it['kind']}] {it['title']}")
+    td = todo_load(repo)
+    for it in td["items"]:
+        for n in it.get("notes", []):
+            if not n.get("seen") and n.get("at", 0) > since:
+                news.append(f"- Person on to-do [{it['id']}] '{clip(it['title'], 60)}': {n['text']}")
     o = org(repo)
     managers = [manager_view(repo, m, s) for m in o["managers"]]
+    # A signal is news once; one still standing is only named (context sizes change every tick).
+    seen_sig, sig_now, standing = set(prev.get("signals") or []), [], []
     for sg in signals_for(repo, None, managers, [], s):
-        if sg["who"] in ("master", "hq", "you"):
+        if sg["who"] in ("master", "hq", "you") or sg["level"] == "info":
             continue
-        lines.append(f"- {sg['level'].upper()} {sg['who']}{' (' + sg['terminal'] + ')' if sg.get('terminal') else ''}: {sg['text']}")
+        key = f"{sg['who']}:{re.sub(r'[0-9]+', '#', sg['text'].split(':')[0])}"
+        sig_now.append(key)
+        if key in seen_sig:
+            standing.append(sg["who"] + (" (context)" if sg["text"].startswith("Context") else ""))
+        else:
+            news.append(f"- {sg['level'].upper()} {sg['who']}{' (' + sg['terminal'] + ')' if sg.get('terminal') else ''}: {sg['text']}")
+    prev["signals"] = sig_now
+    lines_were, lines_now, same, moved = prev.get("managers") or {}, {}, [], []
     for m in managers:
         if m.get("status") == "retired" or not m["live"]:
             continue
         f = m.get("facts") or {}
-        lines.append(f"- {m['id']} {m['terminal']} {m['status']}: {clip(f.get('doing') or f.get('said') or '', 110)}")
+        line = f"{m['id']} {m['terminal']} {m['status']}: {clip(f.get('doing') or f.get('said') or '', 110)}"
+        lines_now[m["id"]] = hashlib.sha1(line.encode()).hexdigest()[:12]
+        if lines_were.get(m["id"]) == lines_now[m["id"]]:
+            same.append(m["id"])
+        else:
+            moved.append(f"- {line}")  # shown, but a manager's line moving is not news that makes steps due
+    prev["managers"] = lines_now
+    news.extend(wfo.tick_lines(H(), repo, since))
+    # Chores the loop doesn't cover; the pages HQ keeps (home, map, next moves, roadmap) are loop steps.
+    chores = []
+    waiting = [i for i in items if i.get("state") == "open" and i["kind"] in ("approval", "question")]
+    stale = [i for i in waiting if NOW() - (i.get("createdAt") or 0) > 30 * 60_000]
+    if stale and news:
+        chores.append("- Still open in the person's inbox: " + "; ".join(f"[{i['id']}] {clip(i['title'], 50)}" for i in stale[:4])
+                      + ". If one is settled or moot, close it: `hq resolve <id> \"how it was settled\"`.")
     n = commits_since_dream()
     if n is not None and n >= s["dreamEvery"] and not dream_running():
-        lines.append(f"- Memory: {n} commits since the last Dream. Run `hq dream` when you're not mid-edit.")
+        chores.append(f"- Memory: {n} commits since the last Dream. Run `hq dream` when you're not mid-edit.")
     if dream_running():
-        lines.append("- A Dream is running: hold memory edits until it finishes.")
-    hm = home_meta(repo)
-    if not hm.get("text"):
-        lines.append("- Home update: none yet. Write it this tick (see 'Home' in your prompt): `hq home set <file>`.")
-    elif NOW() - (hm.get("at") or 0) > 30 * 60_000:
-        lines.append(f"- Home update: written {int((NOW() - hm['at']) / 60000)} min ago. Rewrite it if anything moved (`hq home set <file>`).")
-    td = todo_load(repo)
-    steer = [(it, n) for it in td["items"] for n in it.get("notes", []) if not n.get("seen") and n.get("at", 0) > since]
-    for it, n in steer:
-        lines.append(f"- Person on to-do [{it['id']}] '{clip(it['title'], 60)}': {n['text']}")
-    live_todo = [it for it in td["items"] if it["status"] in ("doing", "next", "blocked")]
-    if not live_todo:
-        lines.append("- Next moves: empty. Write the next steps with `hq todo add` (see 'Next moves' in your prompt).")
-    elif td.get("updatedAt") and NOW() - td["updatedAt"] > 60 * 60_000:
-        lines.append(f"- Next moves: unchanged for {int((NOW() - td['updatedAt']) / 60000)} min. Close what's done, add what's next (`hq todo`).")
-    lm = lens_meta(repo)
-    if not lm.get("at"):
-        lines.append("- Live map: not published yet. `hq lens` explains it; publish one this tick.")
-    elif NOW() - lm["at"] > 45 * 60_000:
-        lines.append(f"- Live map: last published {int((NOW() - lm['at']) / 60000)} min ago. Update it if the picture changed (`hq lens`).")
-    lines.extend(rmap.tick_lines(H(), repo))
-    lines.extend(wfo.tick_lines(H(), repo, since))
-    # Only the master's tick consumes what's new: a manager or the person running `hq tick`
-    # would otherwise take decisions and to-do notes the master never sees.
-    me = who_am_i(repo)
-    if me["role"] == "master" or not me["terminal"]:
+        chores.append("- A Dream is running: hold memory edits until it finishes.")
+    if not home_meta(repo).get("text"):
+        chores.append("- Home update: none yet. Write it this tick (see 'Home' in your prompt): `hq home set <file>`.")
+    hsize = os.path.getsize(p["handoff"]) if os.path.exists(p["handoff"]) else 0
+    if hsize > HANDOFF_MAX:
+        chores.append(f"- Handoff: {hsize // 1000} kB, over {HANDOFF_MAX // 1000} kB. The master rewrites it short (state now, not history); don't append.")
+    if not [it for it in td["items"] if it["status"] in ("doing", "next", "blocked")]:
+        chores.append("- Next moves: empty. Write the next steps with `hq todo add` (see 'Next moves' in your prompt).")
+    if not lens_meta(repo).get("at"):
+        chores.append("- Live map: not published yet. `hq lens` explains it; publish one this tick.")
+    if news:
+        chores.extend(rmap.tick_lines(H(), repo))
+    # The loop's steps come right under the header: a master that trims the output (head, sed)
+    # still gets them. The digest follows.
+    lines = [f"HQ tick {time.strftime('%Y-%m-%d %H:%M')} (last {int((now - since) / 60000) if since else '—'} min ago)",
+             *loops.tick_lines(H(), repo, "master", bool(news) or bool(chores), consume=mine), "What changed:" if news or chores else "", *news, *chores]
+    if moved:
+        lines += ["Managers at work (no step needed for these alone):", *moved]
+    lines = [x for x in lines if x]
+    if same:
+        lines.append(f"- Unchanged since the last tick: {', '.join(same)}.")
+    if standing:
+        lines.append(f"- Still flagged from earlier ticks: {', '.join(standing)}.")
+    if waiting:
+        lines.append(f"- Waiting on the person: {len(waiting)} ({', '.join(clip(i['title'], 50) for i in waiting[:4])})")
+    if not news and not chores:
+        lines.append("Nothing new: skip every step that has nothing to do.")
+    if mine:
+        mbox.mark_read(H(), repo, unread)
         prev["at"] = now
         write_json(p["tick"], prev)
     else:
-        lines.append(f"(Read from {me['role'] or me['terminal']}, not the master: the master's tick cursor was left alone.)")
+        lines.append("(The loop runner owns the tick: you read it without taking anything. Act on its HQ ESCALATION lines; `hq escalations` lists them.)"
+                     if me["role"] == "master" else
+                     f"(Read from {me['role'] or me['terminal']}, not the master: the master's tick cursor and mail were left alone.)")
+    lines += guarded(watches.tick_lines, [], H(), repo, "master")
     print("\n".join(lines))
 
 
@@ -1484,6 +1669,8 @@ def commits_since_dream():
 
 
 def cmd_status(repo, text):
+    if not text.strip() or text.lstrip().startswith("-"):
+        fail('hq status "<one line>": the headline in HQ\'s status strip (a flag like --help is not a headline)')
     p = ensure(repo)
     text = clip(text, 200)
     prev = (claude.read_json(p["status"]) or {}).get("text")
@@ -1643,16 +1830,8 @@ def cmd_compact(addr):
 
 
 def cmd_loop_arm(repo):
-    mt, _ = master_terminal(repo)
-    if not mt:
-        fail("the master isn't running")
-    if status_of(mt) not in ("done", "idle"):
-        fail(f"the master is {status_of(mt)}; arm the loop once it's idle")
-    ok, err = type_text(mt["address"], LOOP_PROMPT)
-    if not ok:
-        fail(err)
-    log_activity(repo, "loop", "Armed the master's loop", by="hq")
-    out({"ok": True})
+    """The status strip's Arm: the same guarded start as HQ > Org > Loops (never a second loop)."""
+    out(loops.arm(H(), repo, "master", resume=True))
 
 
 def cmd_master_open(repo):
@@ -1720,6 +1899,156 @@ def cmd_autopilot(repo):
     out({"did": did})
 
 
+UNITS_IDLE = "units-idle.json"  # in the scope's data dir: when each finished unit was first seen idle
+
+
+def idle_units(repo, s, now=None):
+    """The managers' unit sessions that sit finished (done or idle), and the sessions of retired
+    managers (out of the org, so out of work), with how long: HQ's own clock (from when it first
+    saw one idle at its current turn), since a unit may keep no transcript to date its last
+    write. One that works again starts over. Pinned sessions and ones labelled herdr.hq.keep are
+    kept, and listed as such. An active manager's own session is never one of them."""
+    now = now or NOW()
+    path = os.path.join(paths(repo)["dir"], UNITS_IDLE)
+    seen = claude.read_json(path) or {}
+    rows, keep = [], {}
+    live = {t["address"]: t for t in hc_ls()}
+    for m in org(repo)["managers"]:
+        team = unit_terminals(repo, m, None)
+        own = live.get(m.get("terminal") or "")
+        if m.get("status") == "retired" and own and own.get("agent") == "claude-code":
+            team = [{"terminal": own["address"], "description": f"{m['id']} (retired manager)", "status": own.get("status"), "turn": own.get("turn")}, *team]
+        for u in team:
+            addr, st = u["terminal"], status_of(u)
+            if st not in ("idle", "done"):
+                continue
+            rec = seen.get(addr)
+            if not rec or rec.get("turn") != u.get("turn"):
+                rec = {"since": now, "turn": u.get("turn")}
+            keep[addr] = rec
+            labels = (hc_get(addr) or {}).get("labels") or {}
+            rows.append({"terminal": addr, "manager": m["id"], "unit": u["description"], "status": st, "idleMs": now - rec["since"],
+                         "kept": "herdr.pinned" in labels or "herdr.hq.keep" in labels})
+    write_json(path, keep)
+    return rows
+
+
+SHELLS = ("fish", "zsh", "bash", "sh", "nu", "pwsh")
+
+
+def close_parked_space(addr):
+    """After a unit's session ended: its space, when only idle shells are left there (each at its
+    prompt, per hc), is closed too, so the sidebar doesn't fill with finished worktrees. The
+    worktree on disk stays. Anything else running there (an agent, a build) keeps the space."""
+    code, so, _ = run(["herdr-app", "ls"], timeout=15)
+    if code != 0:
+        return False
+    try:
+        layout = json.loads(so)
+    except ValueError:
+        return False
+    got, _ = claude.hc_json("ls")
+    agent_of = {t["address"]: t.get("agent") for t in (got or {}).get("terminals", [])}
+    for sp in layout.get("spaces") or []:
+        terms = [x for tab in sp.get("tabs") or [] for x in tab.get("terminals") or []]
+        if addr not in [x.get("terminal") for x in terms]:
+            continue
+        others = [x for x in terms if x.get("terminal") != addr]
+        idle = all(not x.get("app") and agent_of.get(x.get("terminal")) in SHELLS for x in others)
+        if not idle:
+            return False
+        code, _, _ = run(["herdr-app", "do", "space.close", "--id", sp["id"], "--confirmed", "true"], timeout=15)
+        return code == 0
+    return False
+
+
+def free_units(repo, s):
+    """Ends unit sessions that finished and sat idle `unitIdleMinutes`: each holds a Claude
+    process and a tab while it waits. Its work stays in its worktree, commits and report; its
+    manager starts a fresh unit for a follow-up (the manager brief says so)."""
+    mins = s.get("unitIdleMinutes") or 0
+    if not s.get("freeUnits") or mins <= 0:
+        return []
+    did = []
+    for u in idle_units(repo, s):
+        if u["kept"] or u["idleMs"] < mins * 60_000:
+            continue
+        # Its space first, while the unit still marks it (closing ends the session with it), else
+        # the session alone.
+        closed = guarded(close_parked_space, False, u["terminal"])
+        code, _, err = (0, "", "") if closed else hc(["kill", u["terminal"]], repo)
+        if code == 0:
+            did.append(f"ended {u['manager']}'s idle {u['unit']} ({u['terminal']}){' and closed its space' if closed else ''}")
+            log_activity(repo, "unit", f"Ended {u['manager']}'s {u['unit']} ({u['terminal']}): finished and idle {u['idleMs'] // 60_000} min",
+                         by="hq", terminal=u["terminal"], manager=u["manager"])
+        else:
+            sys.stderr.write(f"hq: couldn't end unit {u['terminal']}: {err.strip()[:200]}\n")
+    return did
+
+
+def cmd_units(repo):
+    """What free_units would do: every finished unit, how long it has sat idle, and whether it's kept."""
+    s = settings(repo)
+    mins = s.get("unitIdleMinutes") or 0
+    rows = idle_units(repo, s)
+    for u in rows:
+        u["endsInMs"] = None if u["kept"] or not s.get("freeUnits") or mins <= 0 else max(0, mins * 60_000 - u["idleMs"])
+    out({"freeUnits": bool(s.get("freeUnits")) and mins > 0, "unitIdleMinutes": mins, "units": rows})
+
+
+def compact_managers(repo, s):
+    """/compact each idle manager over managerCompactAt, only from a `## Handoff` it wrote in the
+    last 3 h and since its last compaction (it resumes from that), at most one per pass."""
+    if not s.get("autoCompactManagers"):
+        return []
+    live = {t["address"]: t for t in hc_ls()}
+    did, pend_path = [], os.path.join(paths(repo)["dir"], "compacting.json")
+    pending = claude.read_json(pend_path) or {}
+    # A compaction that landed: the manager re-reads its brief (rewritten before the compaction) once, at a small context.
+    for m in org(repo)["managers"]:
+        at, t = pending.get(m["id"]), live.get(m.get("terminal"))
+        if not at or not t or not m.get("sessionId"):
+            continue
+        if NOW() - at > 6 * 3600_000:
+            pending.pop(m["id"])
+        elif status_of(t) in ("idle", "done") and (session_facts(m["sessionId"], t.get("cwd")).get("compactedAt") or 0) >= at - 60_000:
+            code, _, _ = hc(["send", t["address"], f"HQ: you were compacted. Read .audit/{m['id']}/hq-brief.md (HQ's current rules for you: memory, waiting, "
+                                                  "how you write; where it differs from your original brief on those, it wins) and your report's "
+                                                  "## Handoff, then carry on as your loop says."], repo, timeout=25)
+            if code == 0:
+                pending.pop(m["id"])
+                did.append(f"pointed {m['id']} at its updated brief")
+    for m in org(repo)["managers"]:
+        if m["id"] in pending:
+            continue
+        t = live.get(m.get("terminal"))
+        if m.get("status") == "retired" or not t or status_of(t) not in ("idle", "done") or not m.get("sessionId"):
+            continue
+        facts = session_facts(m["sessionId"], t.get("cwd"))
+        ctx, quiet = facts.get("context") or 0, NOW() - (facts.get("lastAt") or NOW())
+        if ctx <= s["managerCompactAt"] or quiet < 2 * 60_000:
+            continue
+        rp = m.get("report")
+        h_at = int(os.path.getmtime(rp) * 1000) if rp and os.path.exists(rp) else 0
+        if not (h_at and NOW() - h_at < 3 * 3600_000 and h_at > (facts.get("compactedAt") or 0)):
+            continue
+        # HQ's current rules for it (memory, waiting, how you write), beside its own brief: an adopted
+        # manager's original brief.md stays, and an HQ-composed one is refreshed too.
+        text = compose_brief(repo, m)
+        write(os.path.join(os.path.dirname(rp), "hq-brief.md"), text)
+        brief = os.path.join(os.path.dirname(rp), "brief.md")
+        if (read(brief, "") or "").startswith("# Manager brief:"):
+            write(brief, text)
+        ok, _ = type_text(t["address"], "/compact")
+        if ok:
+            pending[m["id"]] = NOW()
+            log_activity(repo, "compact", f"Compacted {m['id']} at {ctx // 1000}k tokens", by="hq", terminal=t["address"], manager=m["id"])
+            did.append(f"compacted {m['id']} ({ctx // 1000}k)")
+            break
+    write_json(pend_path, pending)
+    return did
+
+
 def autopilot_scope(repo):
     p = paths(repo)
     s = settings(repo)
@@ -1727,19 +2056,30 @@ def autopilot_scope(repo):
     n = cmd_deliver(repo)
     if n:
         did.append(f"retried {n} decision(s)")
+    did += guarded(free_units, [], repo, s)
     master = master_record(repo, facts=True)
-    if master["terminal"] and master["status"] in ("idle", "done"):
+    did += guarded(watches.autopilot, [], H(), repo)
+    did += guarded(runner.autopilot, [], H(), repo, master, s)
+    did += guarded(compact_managers, [], repo, s)
+    woke = guarded(mbox.gate, [], H(), repo, master, s)  # its own tick turn re-arms and compacts nothing
+    did += woke
+    looper = master.get("runner") or (None if runner.on(H(), repo) else {"terminal": master["terminal"], "status": master["status"]})
+    lfacts = master["loopFacts"]
+    lquiet = NOW() - (lfacts.get("lastAt") or NOW())
+    lapsed = master["loop"]["state"] == "overdue" and not loops.load(H(), repo, "master").get("paused")  # a paused loop stays off
+    # Only a loop that was running and lapsed is re-armed; arming one for the first time is the
+    # person's call (the Arm button), since it changes how the agent behaves. With the runner on,
+    # only the runner is re-armed: the master never picks the loop back up on its own.
+    if looper and looper["status"] in ("idle", "done") and not woke and s["autoRearm"] and lapsed and lquiet > LOOP_GRACE_MS:
+        ok, _ = type_text(looper["terminal"], LOOP_PROMPT)
+        if ok:
+            who = "loop runner" if master.get("runner") else "master"
+            did.append(f"re-armed the {who}'s loop")
+            log_activity(repo, "loop", f"Re-armed the {who}'s loop (it had lapsed)", by="hq")
+    elif master["terminal"] and master["status"] in ("idle", "done") and not woke:
         mt, facts = master_terminal(repo)[0], master["facts"]
         quiet = NOW() - (facts.get("lastAt") or NOW())
-        # Only a loop that was running and lapsed is re-armed; arming one for the first time
-        # is the person's call (the Arm button), since it changes how the master behaves.
-        lapsed = master["loop"]["state"] == "overdue"
-        if s["autoRearm"] and lapsed and quiet > LOOP_GRACE_MS:
-            ok, _ = type_text(mt["address"], LOOP_PROMPT)
-            if ok:
-                did.append("re-armed the master's loop")
-                log_activity(repo, "loop", "Re-armed the master's loop (it had lapsed)", by="hq")
-        elif s["autoCompactMaster"] and (facts.get("context") or 0) > s["masterCompactAt"] and quiet > 60_000:
+        if s["autoCompactMaster"] and (facts.get("context") or 0) > s["masterCompactAt"] and quiet > 60_000:
             # Compact only from a handoff the master really wrote, recently and since its last compaction.
             h_at = int(os.path.getmtime(p["handoff"]) * 1000) if os.path.exists(p["handoff"]) else 0
             if h_at and NOW() - h_at < 3 * 3600_000 and h_at > (facts.get("compactedAt") or 0):
@@ -2351,6 +2691,16 @@ def main(argv):
         if cmd == "memory-show":
             return cmd_memory_show(a[0])
         repo = repo_for(folder, epic)
+        if cmd == "loops":
+            return out(loops.snapshot(H(), repo))
+        if cmd == "loop":
+            return loops.cmd(H(), repo, a)
+        if cmd == "watch":
+            return watches.cmd(H(), repo, a)
+        if cmd in runner.COMMANDS:
+            return runner.COMMANDS[cmd](H(), repo, a)
+        if cmd in mbox.COMMANDS:
+            return mbox.COMMANDS[cmd](H(), repo, a)
         if cmd in wfo.COMMANDS:
             if a[:1] == ["help"]:
                 return print(wfo.HELP)
@@ -2441,6 +2791,8 @@ def main(argv):
             return cmd_master_open(repo)
         if cmd == "autopilot":
             return cmd_autopilot(repo)
+        if cmd == "units":
+            return cmd_units(repo)
         if cmd == "dream":
             return cmd_dream(repo)
         fail(f"unknown command {cmd}; run `hq` for help")
